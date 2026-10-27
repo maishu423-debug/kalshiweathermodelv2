@@ -133,12 +133,21 @@ function modelLabel(key: string) {
 
 // ── Probability Distribution Chart ───────────────────────────────────────────
 
+// Lowest temperature a Kalshi bucket pays out on, e.g. "87° to 88°" is floor 87,
+// "89° or above" is floor 88 (t > floor). The "or below" bucket has no lower end.
+function kalshiBucketStart(b: MarketMomentum): number | null {
+  if (b.floor == null) return null;
+  return b.cap == null ? b.floor + 1 : b.floor;
+}
+
 function ProbDistRows({
   dist,
   ensemble,
+  brackets,
 }: {
   dist: Array<{ temp: number; prob: number }>;
   ensemble: { mean?: number; mode?: number; p10?: number; p90?: number };
+  brackets: MarketMomentum[];
 }) {
   if (!dist || dist.length === 0) return null;
 
@@ -147,10 +156,14 @@ function ProbDistRows({
   const lo = Math.min(...dist.map((d) => d.temp));
   const hi = Math.max(...dist.map((d) => d.temp));
 
-  // 2°F brackets aligned like Kalshi's (88–89, 90–91, ...)
+  // Fixed 2°F buckets that start on the opposite parity to Kalshi's: when Kalshi's buckets
+  // start on an odd number (81–82, 83–84, ...) ours start on an even one (82–83, 84–85, ...),
+  // and vice versa. Without Kalshi data yet, fall back to even starts.
+  const kalshiStart = brackets.map(kalshiBucketStart).find((v): v is number => v != null);
+  const ourParity = kalshiStart == null ? 0 : (((kalshiStart + 1) % 2) + 2) % 2;
   const rows: Array<{ from: number; to: number; prob: number; atLeast: number; atMost: number }> = [];
   let cumulative = 0;
-  for (let from = lo - (((lo % 2) + 2) % 2); from <= hi; from += 2) {
+  for (let from = lo - ((((lo - ourParity) % 2) + 2) % 2); from <= hi; from += 2) {
     const prob = (probAt.get(from) ?? 0) + (probAt.get(from + 1) ?? 0);
     rows.push({ from, to: from + 1, prob, atLeast: 1 - cumulative, atMost: cumulative + prob });
     cumulative += prob;
@@ -713,7 +726,7 @@ export default function Home() {
 
         {/* Probability distribution */}
         {ensemble?.dist && ensemble.dist.length > 0 && (
-          <ProbDistRows dist={ensemble.dist} ensemble={ensemble} />
+          <ProbDistRows dist={ensemble.dist} ensemble={ensemble} brackets={algoState?.analysis ?? []} />
         )}
 
         {/* Momentum table */}

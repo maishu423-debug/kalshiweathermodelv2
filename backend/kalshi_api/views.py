@@ -257,6 +257,34 @@ def autotrader_toggle(request):
     return JsonResponse({**get_state(), "bot": autotrader_status()})
 
 
+@require_GET
+def live_state(_request):
+    """Real-money trading: switch, limits, today's usage and every live order."""
+    from .live_trading import get_live_state
+
+    return JsonResponse(get_live_state())
+
+
+@csrf_exempt
+@require_POST
+def live_toggle(request):
+    """Turn real-money trading on or off. Turning it on needs Kalshi credentials."""
+    from .live_trading import credentials_configured, get_live_state, set_live_enabled
+
+    try:
+        body = json.loads(request.body.decode()) if request.body else {}
+    except json.JSONDecodeError:
+        body = {}
+    enabled = body.get("enabled") is True
+    if enabled and not credentials_configured():
+        return JsonResponse(
+            {"error": "Kalshi API key is not configured on the server (KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_PEM)."},
+            status=400,
+        )
+    set_live_enabled(enabled)
+    return JsonResponse(get_live_state())
+
+
 @csrf_exempt
 @require_POST
 def autotrader_reset(_request):

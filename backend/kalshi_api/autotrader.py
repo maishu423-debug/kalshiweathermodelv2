@@ -1,13 +1,17 @@
 """
-Paper-trading bot.
+Auto-trading bot.
 
-Every 15 minutes between 12:30 PM and 3:30 PM ET (inclusive, 13 cycles a day) it
-reads the latest model forecast and today's Kalshi bracket ladder, then BUYS
-CONTRACTS_PER_TRADE contracts of YES on the highest-probability bracket when our
-model is more bullish than Kalshi, and of NO on each other live bracket where our
-model is less bullish than Kalshi (see algorithm.get_recommendation). It never
-sells; positions are settled from Kalshi's resolved result (paper.settle_positions),
-which also fills the profit/loss into the Google Sheet trade history.
+Every 15 minutes between 12:30 PM and 3:30 PM ET (inclusive, 13 cycles a day) it reads the latest model
+forecast and today's Kalshi bracket ladder and makes AT MOST ONE trade of CONTRACTS_PER_TRADE contracts:
+  * YES on the highest-probability bracket, when our model is more bullish than Kalshi; otherwise
+  * NO on the bracket where our model is furthest below Kalshi's price (see algorithm.get_recommendation).
+It never sells; positions are settled from Kalshi's resolved result (paper.settle_positions), which also
+fills the profit/loss into the Google Sheet trade history.
+
+Two independent switches:
+  * Auto (PaperAccount.auto_enabled) mirrors the trade in the paper account.
+  * Live (PaperAccount.live_enabled, default OFF) also sends it as a real order to Kalshi
+    (live_trading.submit_live_buy, which enforces the per-trade and daily contract limits).
 
 Runs as a daemon thread started from apps.py. Each cycle is keyed by its slot
 ("2026-10-17T12:30"), stored in AutoTradeRun, so a restart can't repeat a cycle.
@@ -21,13 +25,14 @@ from zoneinfo import ZoneInfo
 
 from django.db import IntegrityError, close_old_connections
 
+from .live_trading import LiveTradeSkipped, live_status, settle_live_orders, submit_live_buy
 from .models import AutoTradeRun
 from .paper import PaperTradeError, get_account, parse_order, place_order, settle_positions
 
 
 ET = ZoneInfo("America/New_York")
 
-CONTRACTS_PER_TRADE = 100
+CONTRACTS_PER_TRADE = 50
 INTERVAL_MINUTES = 15
 WINDOW_START = (12, 30)
 WINDOW_END = (15, 30)
@@ -75,6 +80,16 @@ def slot_key(slot: datetime) -> str:
     return slot.strftime("%Y-%m-%dT%H:%M")
 
 
+def pick_leg(rec: dict):
+    """The single trade for this cycle: the YES leg if there is a YES edge, else the NO with the biggest edge."""
+    if rec.get("yes_trade"):
+        return rec["yes_trade"]
+    no_trades = rec.get("no_trades") or []
+    if not no_trades:
+        return None
+    return max(no_trades, key=lambda leg: leg["kalshi_prob"] - leg["model_prob"])
+
+
 def get_status() -> dict:
     now = datetime.now(ET)
     return {
@@ -85,6 +100,7 @@ def get_status() -> dict:
         "contracts_per_trade": CONTRACTS_PER_TRADE,
         "interval_minutes": INTERVAL_MINUTES,
         "window": f"{WINDOW_START[0]}:{WINDOW_START[1]:02d} – {WINDOW_END[0]}:{WINDOW_END[1]:02d} ET",
+        "live": live_status(),
     }
 
 
@@ -132,9 +148,26 @@ def run_cycle(key: str):
         if rec["status"] != "ready":
             return finish("skipped", rec["reason"], mean)
 
-        legs = ([rec["yes_trade"]] if rec.get("yes_trade") else []) + rec.get("no_trades", [])
+        leg = pick_leg(rec)
+        if leg is None:
+            return finish("skipped", rec["reason"], mean)
+        account = get_account()
         placed, notes = 0, []
-        for leg in legs:
+
+        # Real order first: it is the one that matters.
+        if account.live_enabled:
+            try:
+                live = submit_live_buy(key, leg)
+                if live.status in ("filled", "partial"):
+                    placed += 1
+                notes.append(f"LIVE {live.status}: {float(live.fill_count):g}/{live.contracts_requested} "
+                             f"{leg['side'].upper()} {leg['label']}" + (f" ({live.message})" if live.message else ""))
+            except LiveTradeSkipped as exc:
+                notes.append(f"LIVE skipped: {exc}")
+            except Exception as exc:  # never let a live failure stop the paper mirror
+                notes.append(f"LIVE error: {type(exc).__name__}: {exc}")
+
+        if account.auto_enabled:
             try:
                 place_order(parse_order(json.dumps({
                     "action":        "buy",
@@ -150,7 +183,7 @@ def run_cycle(key: str):
             except PaperTradeError as exc:
                 notes.append(f"{leg['side'].upper()} {leg['label']}: {exc}")
 
-        message = rec["reason"] + (" — failed: " + "; ".join(notes) if notes else "")
+        message = f"{rec['reason']} → trading {leg['side'].upper()} {leg['label']}" + (" — " + "; ".join(notes) if notes else "")
         return finish("traded" if placed else "error", message, mean, placed)
     except Exception as exc:  # never leave a run stuck in "running"
         return finish("error", f"{type(exc).__name__}: {exc}")
@@ -158,7 +191,8 @@ def run_cycle(key: str):
 
 def tick(now: datetime = None):
     now = now or datetime.now(ET)
-    if not get_account().auto_enabled:
+    account = get_account()
+    if not (account.auto_enabled or account.live_enabled):
         return
     slot = current_slot(now)
     if slot is not None:
@@ -179,6 +213,9 @@ def _loop():
                 n = settle_positions()
                 if n:
                     print(f"[autotrader] settled {n} position(s)")
+                n = settle_live_orders()
+                if n:
+                    print(f"[autotrader] settled {n} live order(s)")
         except Exception as exc:
             print(f"[autotrader] loop error ({type(exc).__name__}: {exc})")
         finally:

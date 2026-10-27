@@ -1686,3 +1686,24 @@ h1 {
   max-width: 460px;
   color: #6f6a63;
 }
+
+/* Live (real-money) trading panel */
+.lt-panel { border-color: #dedbd3; }
+.lt-panel--on { border-color: #c0392b; box-shadow: 0 0 0 2px rgba(192, 57, 43, 0.15); }
+
+.lt-env {
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+}
+.lt-env--production { background: #fde8e8; color: #9c1d1d; }
+.lt-env--demo       { background: #e8f0fe; color: #1a4fa0; }
+.lt-status--on      { background: #fde8e8; color: #9c1d1d; }
+
+.lt-usage { margin: 6px 0 16px; }
+.lt-usage-text { font-size: 14px; margin-bottom: 6px; }
+.lt-bar { height: 8px; border-radius: 4px; background: #e6e3dc; overflow: hidden; }
+.lt-bar span { display: block; height: 100%; background: #13936a; }
+.lt-sub { margin-top: 18px; }

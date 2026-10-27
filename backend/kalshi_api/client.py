@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import time
 import urllib.error
 from datetime import date
@@ -8,7 +9,11 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
-KALSHI_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
+# Point KALSHI_API_BASE_URL at https://external-api.demo.kalshi.co/trade-api/v2 (with demo keys) to
+# rehearse live trading with fake money.
+KALSHI_BASE_URL = os.environ.get(
+    "KALSHI_API_BASE_URL", "https://external-api.kalshi.com/trade-api/v2"
+).strip().rstrip("/")
 MIAMI_SERIES_TICKER = "KXHIGHMIA"
 
 
@@ -312,6 +317,38 @@ def place_kalshi_order(ticker, action, count, yes_price_cents, time_in_force="go
         "price":                       price_str,
         "time_in_force":               time_in_force,
         "self_trade_prevention_type":  "taker_at_cross",
+    }
+    return post_json("/portfolio/events/orders", body)
+
+
+def place_kalshi_buy(ticker, outcome_side, count, price_cents, client_order_id):
+    """
+    Buy `count` contracts of `outcome_side` ("yes" or "no") with an immediate-or-cancel limit order.
+
+    Kalshi's V2 order endpoint only knows the YES book, and its price is always the YES-leg price:
+      YES at p cents -> side "bid", price p
+      NO  at p cents -> side "ask", price 100 - p   (an ask on the YES book is the NO direction)
+    Unfilled contracts are cancelled right away, so nothing is left resting in the book.
+    Returns Kalshi's response: order_id, fill_count, remaining_count, average_fill_price, average_fee_paid.
+    """
+    price_cents = int(price_cents)
+    if not 1 <= price_cents <= 99:
+        raise KalshiClientError(f"Refusing to order at {price_cents}c.")
+    if outcome_side == "yes":
+        book_side, yes_price = "bid", price_cents
+    elif outcome_side == "no":
+        book_side, yes_price = "ask", 100 - price_cents
+    else:
+        raise KalshiClientError(f"Unknown side {outcome_side!r}.")
+
+    body = {
+        "ticker":                     ticker,
+        "client_order_id":            client_order_id,
+        "side":                       book_side,
+        "count":                      f"{int(count)}.00",
+        "price":                      f"{yes_price / 100:.4f}",
+        "time_in_force":              "immediate_or_cancel",
+        "self_trade_prevention_type": "taker_at_cross",
     }
     return post_json("/portfolio/events/orders", body)
 

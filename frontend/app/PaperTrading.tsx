@@ -261,9 +261,12 @@ export default function PaperTrading({
   const status = !bot.enabled ? "paused" : bot.window_open ? "running" : "idle";
   const statusText = { paused: "Paused", running: "Trading window open", idle: "Outside trading window" }[status];
 
-  const plan: Leg[] = recommendation?.status === "ready"
-    ? [...(recommendation.yes_trade ? [recommendation.yes_trade] : []), ...(recommendation.no_trades ?? [])]
-    : [];
+  // One trade per cycle, same rule as the bot: YES if there is a YES edge, else the NO with the biggest edge.
+  const bestNo = [...(recommendation?.no_trades ?? [])].sort(
+    (a, b) => (b.kalshi_prob ?? 0) - b.model_prob - ((a.kalshi_prob ?? 0) - a.model_prob)
+  )[0];
+  const nextLeg = recommendation?.status === "ready" ? recommendation.yes_trade ?? bestNo : undefined;
+  const plan: Leg[] = nextLeg ? [nextLeg] : [];
 
   const historyRows = history ?? [];
   const historyNet = historyRows.reduce((sum, h) => sum + (h.realized_pl_cents ?? 0), 0);

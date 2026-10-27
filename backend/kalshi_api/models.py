@@ -7,6 +7,9 @@ class PaperAccount(models.Model):
     name = models.CharField(max_length=64, unique=True, default="default")
     cash_cents = models.IntegerField(default=1_000_000)
     auto_enabled = models.BooleanField(default=True)
+    # Real-money switch: when on, each auto-trade cycle also sends its order to the real Kalshi account.
+    # Always starts off; only the Live Trading panel turns it on.
+    live_enabled = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -49,3 +52,30 @@ class AutoTradeRun(models.Model):
     message = models.TextField(blank=True)
     forecast_mean = models.FloatField(null=True, blank=True)
     trades_count = models.IntegerField(default=0)
+
+
+class LiveOrder(models.Model):
+    """One real order sent to Kalshi. The row is written BEFORE the order is sent, and `client_order_id`
+    is unique, so a crash or restart can never send the same slot's order twice."""
+    client_order_id = models.CharField(max_length=96, unique=True)
+    slot = models.CharField(max_length=32)
+    et_date = models.CharField(max_length=10, db_index=True)   # Eastern trading day, for the daily limit
+    market_ticker = models.CharField(max_length=128)
+    market_label = models.CharField(max_length=128, blank=True)
+    side = models.CharField(max_length=3, choices=[("yes", "Yes"), ("no", "No")])
+    limit_price_cents = models.IntegerField()
+    contracts_requested = models.IntegerField()
+    # pending (about to send) | filled | partial | unfilled | error (rejected, not counted toward the
+    # daily limit) | unknown (send failed ambiguously, counted) | mismatch (position moved the wrong way)
+    status = models.CharField(max_length=10, default="pending")
+    order_id = models.CharField(max_length=64, blank=True)
+    fill_count = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0"))
+    avg_price_cents = models.FloatField(null=True, blank=True)   # our side's average fill price
+    fee_cents = models.FloatField(null=True, blank=True)         # total fee for the fill
+    message = models.TextField(blank=True)
+    model_prob = models.FloatField(null=True, blank=True)
+    kalshi_prob = models.FloatField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    settled_at = models.DateTimeField(null=True, blank=True)
+    payout_cents = models.IntegerField(null=True, blank=True)
+    realized_pl_cents = models.IntegerField(null=True, blank=True)

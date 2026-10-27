@@ -58,13 +58,15 @@ def contracts_used_today() -> int:
 
 
 def credentials_configured() -> bool:
-    from .auth import KalshiAuthError, get_api_key_id, get_private_key
+    """True only if a key ID is set AND the private key can actually sign (RSA-PSS). An Ed25519 key loads
+    fine but cannot sign this way, so loading alone is not enough."""
+    from .auth import get_api_key_id, get_private_key, sign_pss_text
 
     if not get_api_key_id():
         return False
     try:
-        get_private_key()
-    except (KalshiAuthError, ValueError, TypeError):
+        sign_pss_text(get_private_key(), "check")
+    except Exception:
         return False
     return True
 

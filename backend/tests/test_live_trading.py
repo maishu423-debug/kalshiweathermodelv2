@@ -265,3 +265,31 @@ def test_cycle_stops_quietly_at_the_daily_limit(monkeypatch):
                                  side="yes", limit_price_cents=40, contracts_requested=50, status="filled")
     fake, run, paper = _cycle(monkeypatch, READY, live=True, auto=False)
     assert fake.orders == [] and "daily limit" in run.message
+
+
+# ── Credentials ───────────────────────────────────────────────────────────────
+
+def _pem(private_key):
+    from cryptography.hazmat.primitives import serialization
+    return private_key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    ).decode()
+
+
+def test_rsa_key_counts_as_configured(monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "abc")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PEM", _pem(rsa.generate_private_key(public_exponent=65537, key_size=2048)))
+    assert lt.credentials_configured() is True
+
+
+def test_ed25519_key_is_not_accepted(monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "abc")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PEM", _pem(ed25519.Ed25519PrivateKey.generate()))
+    assert lt.credentials_configured() is False
+
+
+def test_missing_key_id_is_not_configured(monkeypatch):
+    monkeypatch.delenv("KALSHI_API_KEY_ID", raising=False)
+    assert lt.credentials_configured() is False

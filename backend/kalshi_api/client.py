@@ -292,67 +292,6 @@ def get_portfolio_positions(cursor=None):
     return fetch_json_auth("/portfolio/positions", params)
 
 
-def place_kalshi_order(ticker, action, count, yes_price_cents, time_in_force="good_till_canceled"):
-    """
-    Place a real order on Kalshi using the V2 orders endpoint.
-
-    action          : "buy" or "sell"
-    count           : integer number of contracts
-    yes_price_cents : integer price in cents (1-99)
-    time_in_force   : "good_till_canceled" | "immediate_or_cancel" | "fill_or_kill"
-
-    V2 mapping:
-      buy  → side "bid"
-      sell → side "ask"
-      price is sent as a 4-decimal dollar string e.g. "0.4500"
-    """
-    v2_side     = "bid" if action == "buy" else "ask"
-    price_str   = f"{int(yes_price_cents) / 100:.4f}"   # "0.4500"
-    count_str   = f"{int(count)}.00"                     # "10.00"
-
-    body = {
-        "ticker":                      ticker,
-        "side":                        v2_side,
-        "count":                       count_str,
-        "price":                       price_str,
-        "time_in_force":               time_in_force,
-        "self_trade_prevention_type":  "taker_at_cross",
-    }
-    return post_json("/portfolio/events/orders", body)
-
-
-def place_kalshi_buy(ticker, outcome_side, count, price_cents, client_order_id):
-    """
-    Buy `count` contracts of `outcome_side` ("yes" or "no") with an immediate-or-cancel limit order.
-
-    Kalshi's V2 order endpoint only knows the YES book, and its price is always the YES-leg price:
-      YES at p cents -> side "bid", price p
-      NO  at p cents -> side "ask", price 100 - p   (an ask on the YES book is the NO direction)
-    Unfilled contracts are cancelled right away, so nothing is left resting in the book.
-    Returns Kalshi's response: order_id, fill_count, remaining_count, average_fill_price, average_fee_paid.
-    """
-    price_cents = int(price_cents)
-    if not 1 <= price_cents <= 99:
-        raise KalshiClientError(f"Refusing to order at {price_cents}c.")
-    if outcome_side == "yes":
-        book_side, yes_price = "bid", price_cents
-    elif outcome_side == "no":
-        book_side, yes_price = "ask", 100 - price_cents
-    else:
-        raise KalshiClientError(f"Unknown side {outcome_side!r}.")
-
-    body = {
-        "ticker":                     ticker,
-        "client_order_id":            client_order_id,
-        "side":                       book_side,
-        "count":                      f"{int(count)}.00",
-        "price":                      f"{yes_price / 100:.4f}",
-        "time_in_force":              "immediate_or_cancel",
-        "self_trade_prevention_type": "taker_at_cross",
-    }
-    return post_json("/portfolio/events/orders", body)
-
-
 def get_miami_temperature_payload(selected_market_ticker=None, include_orderbook=True):
     event_ticker = get_today_event_ticker()
     selected_market_ticker = selected_market_ticker or get_default_market_ticker()

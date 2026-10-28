@@ -7,8 +7,7 @@ class PaperAccount(models.Model):
     name = models.CharField(max_length=64, unique=True, default="default")
     cash_cents = models.IntegerField(default=1_000_000)
     auto_enabled = models.BooleanField(default=True)
-    # Real-money switch: when on, each auto-trade cycle also sends its order to the real Kalshi account.
-    # Always starts off; only the Live Trading panel turns it on.
+    # Unused: automatic real-money trading was removed (alerts are sent instead). Kept so the applied migration stays valid.
     live_enabled = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -55,8 +54,7 @@ class AutoTradeRun(models.Model):
 
 
 class LiveOrder(models.Model):
-    """One real order sent to Kalshi. The row is written BEFORE the order is sent, and `client_order_id`
-    is unique, so a crash or restart can never send the same slot's order twice."""
+    """Unused: automatic real-money trading was removed. Kept so the applied migration stays valid."""
     client_order_id = models.CharField(max_length=96, unique=True)
     slot = models.CharField(max_length=32)
     et_date = models.CharField(max_length=10, db_index=True)   # Eastern trading day, for the daily limit

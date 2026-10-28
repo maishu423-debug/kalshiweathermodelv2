@@ -8,10 +8,9 @@ forecast and today's Kalshi bracket ladder and makes AT MOST ONE trade of CONTRA
 It never sells; positions are settled from Kalshi's resolved result (paper.settle_positions), which also
 fills the profit/loss into the Google Sheet trade history.
 
-Two independent switches:
-  * Auto (PaperAccount.auto_enabled) mirrors the trade in the paper account.
-  * Live (PaperAccount.live_enabled, default OFF) also sends it as a real order to Kalshi
-    (live_trading.submit_live_buy, which enforces the per-trade and daily contract limits).
+The paper account buys that one trade (when Auto is on). Every edge found in the cycle, not just that one, is
+sent to you in a single Telegram alert (notifier.format_edge_alert), so you can place trades by hand
+on Kalshi. Nothing here sends real orders.
 
 Runs as a daemon thread started from apps.py. Each cycle is keyed by its slot
 ("2026-10-17T12:30"), stored in AutoTradeRun, so a restart can't repeat a cycle.
@@ -25,8 +24,8 @@ from zoneinfo import ZoneInfo
 
 from django.db import IntegrityError, close_old_connections
 
-from .live_trading import LiveTradeSkipped, live_status, settle_live_orders, submit_live_buy
 from .models import AutoTradeRun
+from .notifier import channels_status, format_edge_alert, notify_all
 from .paper import PaperTradeError, get_account, parse_order, place_order, settle_positions
 
 
@@ -90,6 +89,12 @@ def pick_leg(rec: dict):
     return max(no_trades, key=lambda leg: leg["kalshi_prob"] - leg["model_prob"])
 
 
+def all_legs(rec: dict) -> list:
+    """Every edge this cycle, best first: the YES leg (if any), then the NOs by size of edge."""
+    nos = sorted(rec.get("no_trades") or [], key=lambda leg: leg["kalshi_prob"] - leg["model_prob"], reverse=True)
+    return ([rec["yes_trade"]] if rec.get("yes_trade") else []) + nos
+
+
 def get_status() -> dict:
     now = datetime.now(ET)
     return {
@@ -100,7 +105,7 @@ def get_status() -> dict:
         "contracts_per_trade": CONTRACTS_PER_TRADE,
         "interval_minutes": INTERVAL_MINUTES,
         "window": f"{WINDOW_START[0]}:{WINDOW_START[1]:02d} – {WINDOW_END[0]}:{WINDOW_END[1]:02d} ET",
-        "live": live_status(),
+        "alerts": channels_status(),
     }
 
 
@@ -154,19 +159,6 @@ def run_cycle(key: str):
         account = get_account()
         placed, notes = 0, []
 
-        # Real order first: it is the one that matters.
-        if account.live_enabled:
-            try:
-                live = submit_live_buy(key, leg)
-                if live.status in ("filled", "partial"):
-                    placed += 1
-                notes.append(f"LIVE {live.status}: {float(live.fill_count):g}/{live.contracts_requested} "
-                             f"{leg['side'].upper()} {leg['label']}" + (f" ({live.message})" if live.message else ""))
-            except LiveTradeSkipped as exc:
-                notes.append(f"LIVE skipped: {exc}")
-            except Exception as exc:  # never let a live failure stop the paper mirror
-                notes.append(f"LIVE error: {type(exc).__name__}: {exc}")
-
         if account.auto_enabled:
             try:
                 place_order(parse_order(json.dumps({
@@ -183,7 +175,19 @@ def run_cycle(key: str):
             except PaperTradeError as exc:
                 notes.append(f"{leg['side'].upper()} {leg['label']}: {exc}")
 
-        message = f"{rec['reason']} → trading {leg['side'].upper()} {leg['label']}" + (" — " + "; ".join(notes) if notes else "")
+        # Alert on every edge found, whether or not the paper order went through: you trade by hand.
+        slot_time = datetime.strptime(key, "%Y-%m-%dT%H:%M").strftime("%I:%M %p").lstrip("0")
+        paper_traded = account.auto_enabled and placed > 0
+        paper_note = "Paper account: " + (f"bought the ★ trade ({CONTRACTS_PER_TRADE} contracts)." if paper_traded else "no paper trade.")
+        subject, body = format_edge_alert(
+            all_legs(rec), slot_time, mean, CONTRACTS_PER_TRADE,
+            traded=leg if paper_traded else None, paper_note=paper_note,
+        )
+        for result in notify_all(subject, body):
+            if not result["ok"]:
+                notes.append(f"{result['channel']} alert failed: {result['detail']}")
+
+        message = f"{rec['reason']} → paper {leg['side'].upper()} {leg['label']}" + (" — " + "; ".join(notes) if notes else "")
         return finish("traded" if placed else "error", message, mean, placed)
     except Exception as exc:  # never leave a run stuck in "running"
         return finish("error", f"{type(exc).__name__}: {exc}")
@@ -191,8 +195,7 @@ def run_cycle(key: str):
 
 def tick(now: datetime = None):
     now = now or datetime.now(ET)
-    account = get_account()
-    if not (account.auto_enabled or account.live_enabled):
+    if not get_account().auto_enabled:
         return
     slot = current_slot(now)
     if slot is not None:
@@ -213,9 +216,6 @@ def _loop():
                 n = settle_positions()
                 if n:
                     print(f"[autotrader] settled {n} position(s)")
-                n = settle_live_orders()
-                if n:
-                    print(f"[autotrader] settled {n} live order(s)")
         except Exception as exc:
             print(f"[autotrader] loop error ({type(exc).__name__}: {exc})")
         finally:

@@ -106,6 +106,7 @@ type PaperState = {
     contracts_per_trade: number;
     interval_minutes: number;
     window: string;
+    alerts?: { telegram_configured: boolean };
   };
 };
 
@@ -224,6 +225,17 @@ export default function PaperTrading({
     }
   }
 
+  async function testAlert() {
+    setBusy(true);
+    try {
+      const res = await fetch("/api/kalshi/autotrader/notify-test", { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      window.alert(res.ok ? `Test alert sent (${data.detail}).` : `Alert failed: ${data.detail ?? res.status}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function resetAccount() {
     if (window.confirm("Reset the paper account? This clears all positions, trades and bot history and restores $10,000.")) {
       post("reset");
@@ -242,6 +254,7 @@ export default function PaperTrading({
   }
 
   const { account, bot } = state;
+  const alertsOn = Boolean(bot.alerts?.telegram_configured);
   const bookByTicker = new Map(books.map((b) => [b.ticker, b]));
 
   // Mark open positions to the current bid (what we could sell for). No quote → valued at cost.
@@ -292,6 +305,14 @@ export default function PaperTrading({
             onClick={() => post("toggle", { enabled: !bot.enabled })}
           >
             {bot.enabled ? "Pause bot" : "Start bot"}
+          </button>
+          <button
+            className="algo-btn algo-btn--refresh"
+            disabled={busy}
+            onClick={testAlert}
+            title={alertsOn ? "Send a test message to Telegram" : "Telegram is not configured on the server"}
+          >
+            {alertsOn ? "Test alert" : "Alerts off"}
           </button>
           <button className="algo-btn algo-btn--refresh" disabled={busy} onClick={resetAccount}>
             Reset

@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import LiveTrading from "./LiveTrading";
 import PaperTrading, { type Recommendation } from "./PaperTrading";
 
 
@@ -813,8 +812,6 @@ export default function Home() {
       </div>
 
       {/* ── Paper trading bot + trade history (Google Sheet) ── */}
-      <LiveTrading />
-
       <PaperTrading books={payload.markets} recommendation={algoState?.recommendation} />
 
       {/* ── Market list ── */}

@@ -257,32 +257,18 @@ def autotrader_toggle(request):
     return JsonResponse({**get_state(), "bot": autotrader_status()})
 
 
-@require_GET
-def live_state(_request):
-    """Real-money trading: switch, limits, today's usage and every live order."""
-    from .live_trading import get_live_state
-
-    return JsonResponse(get_live_state())
-
-
 @csrf_exempt
 @require_POST
-def live_toggle(request):
-    """Turn real-money trading on or off. Turning it on needs Kalshi credentials."""
-    from .live_trading import credentials_configured, get_live_state, set_live_enabled
+def notify_test(_request):
+    """Send a test alert to every configured channel so you can check the setup."""
+    from .notifier import notify_all
 
-    try:
-        body = json.loads(request.body.decode()) if request.body else {}
-    except json.JSONDecodeError:
-        body = {}
-    enabled = body.get("enabled") is True
-    if enabled and not credentials_configured():
-        return JsonResponse(
-            {"error": "Kalshi API key is not configured on the server (KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_PEM)."},
-            status=400,
-        )
-    set_live_enabled(enabled)
-    return JsonResponse(get_live_state())
+    results = notify_all("Kalshi bot: test alert", "✅ Alerts are working.")
+    if not results:
+        return JsonResponse({"ok": False, "detail": "No alert channel is configured on the server."}, status=400)
+    ok = any(r["ok"] for r in results)
+    detail = "; ".join(f"{r['channel']}: {r['detail']}" for r in results)
+    return JsonResponse({"ok": ok, "detail": detail, "results": results}, status=200 if ok else 400)
 
 
 @csrf_exempt

@@ -2,14 +2,14 @@
 Auto-trading bot.
 
 Every 15 minutes between 12:30 PM and 3:30 PM ET (inclusive, 13 cycles a day) it reads the latest model
-forecast and today's Kalshi bracket ladder and makes AT MOST ONE trade of CONTRACTS_PER_TRADE contracts:
-  * YES on the highest-probability bracket, when our model is more bullish than Kalshi; otherwise
-  * NO on the bracket where our model is furthest below Kalshi's price (see algorithm.get_recommendation).
-It never sells; positions are settled from Kalshi's resolved result (paper.settle_positions), which also
-fills the profit/loss into the Google Sheet trade history.
+forecast and today's Kalshi bracket ladder, then BUYS CONTRACTS_PER_TRADE contracts of YES on the
+highest-probability bracket when our model is more bullish than Kalshi, and of NO on each other live bracket
+where our model is less bullish than Kalshi (see algorithm.get_recommendation). It never sells; positions are
+settled from Kalshi's resolved result (paper.settle_positions), which also fills the profit/loss into the
+Google Sheet trade history.
 
-The paper account buys that one trade (when Auto is on). Every edge found in the cycle, not just that one, is
-sent to you in a single Telegram alert (notifier.format_edge_alert), so you can place trades by hand
+Every edge found in the cycle is also sent to you in a single Telegram / email alert
+(notifier.format_edge_alert), with the legs the paper account bought marked, so you can place trades by hand
 on Kalshi. Nothing here sends real orders.
 
 Runs as a daemon thread started from apps.py. Each cycle is keyed by its slot
@@ -25,13 +25,14 @@ from zoneinfo import ZoneInfo
 from django.db import IntegrityError, close_old_connections
 
 from .models import AutoTradeRun
-from .notifier import channels_status, format_edge_alert, notify_all
+from .notifier import (channels_status, format_edge_alert, format_trade_alert, format_trade_failure,
+                       notify_all, trade_alerts_enabled)
 from .paper import PaperTradeError, get_account, parse_order, place_order, settle_positions
 
 
 ET = ZoneInfo("America/New_York")
 
-CONTRACTS_PER_TRADE = 50
+CONTRACTS_PER_TRADE = 100
 INTERVAL_MINUTES = 15
 WINDOW_START = (12, 30)
 WINDOW_END = (15, 30)
@@ -79,18 +80,8 @@ def slot_key(slot: datetime) -> str:
     return slot.strftime("%Y-%m-%dT%H:%M")
 
 
-def pick_leg(rec: dict):
-    """The single trade for this cycle: the YES leg if there is a YES edge, else the NO with the biggest edge."""
-    if rec.get("yes_trade"):
-        return rec["yes_trade"]
-    no_trades = rec.get("no_trades") or []
-    if not no_trades:
-        return None
-    return max(no_trades, key=lambda leg: leg["kalshi_prob"] - leg["model_prob"])
-
-
 def all_legs(rec: dict) -> list:
-    """Every edge this cycle, best first: the YES leg (if any), then the NOs by size of edge."""
+    """Every edge this cycle, for the alert: the YES leg (if any), then the NOs by size of edge."""
     nos = sorted(rec.get("no_trades") or [], key=lambda leg: leg["kalshi_prob"] - leg["model_prob"], reverse=True)
     return ([rec["yes_trade"]] if rec.get("yes_trade") else []) + nos
 
@@ -153,41 +144,52 @@ def run_cycle(key: str):
         if rec["status"] != "ready":
             return finish("skipped", rec["reason"], mean)
 
-        leg = pick_leg(rec)
-        if leg is None:
-            return finish("skipped", rec["reason"], mean)
+        legs = ([rec["yes_trade"]] if rec.get("yes_trade") else []) + rec.get("no_trades", [])
         account = get_account()
-        placed, notes = 0, []
+        slot_time = datetime.strptime(key, "%Y-%m-%dT%H:%M").strftime("%I:%M %p").lstrip("0")
+        placed, notes, bought, alert_notes = 0, [], [], []
+
+        def alert(build, channels=None):
+            """Build and send one alert. Whatever goes wrong here is only noted: it must never stop a trade."""
+            try:
+                subject, body = build()
+                for outcome in notify_all(subject, body, channels=channels):
+                    if not outcome["ok"]:
+                        alert_notes.append(f"{outcome['channel']} alert failed: {outcome['detail']}")
+            except Exception as exc:
+                alert_notes.append(f"alert error: {type(exc).__name__}")
 
         if account.auto_enabled:
-            try:
-                place_order(parse_order(json.dumps({
-                    "action":        "buy",
-                    "side":          leg["side"],
-                    "market_ticker": leg["ticker"],
-                    "market_label":  leg["label"],
-                    "price_cents":   leg["price_cents"],
-                    "contracts":     CONTRACTS_PER_TRADE,
-                    "model_prob":    leg.get("model_prob"),
-                    "kalshi_prob":   leg.get("kalshi_prob"),
-                }).encode()))
-                placed += 1
-            except PaperTradeError as exc:
-                notes.append(f"{leg['side'].upper()} {leg['label']}: {exc}")
+            for leg in legs:
+                try:
+                    result = place_order(parse_order(json.dumps({
+                        "action":        "buy",
+                        "side":          leg["side"],
+                        "market_ticker": leg["ticker"],
+                        "market_label":  leg["label"],
+                        "price_cents":   leg["price_cents"],
+                        "contracts":     CONTRACTS_PER_TRADE,
+                        "model_prob":    leg.get("model_prob"),
+                        "kalshi_prob":   leg.get("kalshi_prob"),
+                    }).encode()))
+                    placed += 1
+                    bought.append(leg)
+                    if trade_alerts_enabled():                      # one Telegram message per paper trade, as it happens
+                        alert(lambda: format_trade_alert(result, leg, slot_time), channels=("telegram",))
+                except PaperTradeError as exc:
+                    notes.append(f"{leg['side'].upper()} {leg['label']}: {exc}")
+                    if trade_alerts_enabled():
+                        alert(lambda: format_trade_failure(leg, CONTRACTS_PER_TRADE, str(exc), slot_time),
+                              channels=("telegram",))
 
-        # Alert on every edge found, whether or not the paper order went through: you trade by hand.
-        slot_time = datetime.strptime(key, "%Y-%m-%dT%H:%M").strftime("%I:%M %p").lstrip("0")
-        paper_traded = account.auto_enabled and placed > 0
-        paper_note = "Paper account: " + (f"bought the ★ trade ({CONTRACTS_PER_TRADE} contracts)." if paper_traded else "no paper trade.")
-        subject, body = format_edge_alert(
-            all_legs(rec), slot_time, mean, CONTRACTS_PER_TRADE,
-            traded=leg if paper_traded else None, paper_note=paper_note,
-        )
-        for result in notify_all(subject, body):
-            if not result["ok"]:
-                notes.append(f"{result['channel']} alert failed: {result['detail']}")
+        # The edge summary: every edge found, whether or not the paper orders went through (you can trade by hand).
+        paper_note = "Paper account: " + (
+            f"bought every ★ leg ({CONTRACTS_PER_TRADE} contracts each)." if bought else "no paper trades.")
+        alert(lambda: format_edge_alert(all_legs(rec), slot_time, mean, CONTRACTS_PER_TRADE,
+                                        traded=bought, paper_note=paper_note))
 
-        message = f"{rec['reason']} → paper {leg['side'].upper()} {leg['label']}" + (" — " + "; ".join(notes) if notes else "")
+        message = rec["reason"] + (" — failed: " + "; ".join(notes) if notes else "") + (
+            " — " + "; ".join(alert_notes) if alert_notes else "")
         return finish("traded" if placed else "error", message, mean, placed)
     except Exception as exc:  # never leave a run stuck in "running"
         return finish("error", f"{type(exc).__name__}: {exc}")

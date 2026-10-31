@@ -106,7 +106,7 @@ type PaperState = {
     contracts_per_trade: number;
     interval_minutes: number;
     window: string;
-    alerts?: { telegram_configured: boolean };
+    alerts?: { telegram_configured: boolean; email_configured: boolean };
   };
 };
 
@@ -254,7 +254,7 @@ export default function PaperTrading({
   }
 
   const { account, bot } = state;
-  const alertsOn = Boolean(bot.alerts?.telegram_configured);
+  const alertsOn = Boolean(bot.alerts?.telegram_configured || bot.alerts?.email_configured);
   const bookByTicker = new Map(books.map((b) => [b.ticker, b]));
 
   // Mark open positions to the current bid (what we could sell for). No quote → valued at cost.
@@ -274,12 +274,9 @@ export default function PaperTrading({
   const status = !bot.enabled ? "paused" : bot.window_open ? "running" : "idle";
   const statusText = { paused: "Paused", running: "Trading window open", idle: "Outside trading window" }[status];
 
-  // One trade per cycle, same rule as the bot: YES if there is a YES edge, else the NO with the biggest edge.
-  const bestNo = [...(recommendation?.no_trades ?? [])].sort(
-    (a, b) => (b.kalshi_prob ?? 0) - b.model_prob - ((a.kalshi_prob ?? 0) - a.model_prob)
-  )[0];
-  const nextLeg = recommendation?.status === "ready" ? recommendation.yes_trade ?? bestNo : undefined;
-  const plan: Leg[] = nextLeg ? [nextLeg] : [];
+  const plan: Leg[] = recommendation?.status === "ready"
+    ? [...(recommendation.yes_trade ? [recommendation.yes_trade] : []), ...(recommendation.no_trades ?? [])]
+    : [];
 
   const historyRows = history ?? [];
   const historyNet = historyRows.reduce((sum, h) => sum + (h.realized_pl_cents ?? 0), 0);
@@ -310,7 +307,7 @@ export default function PaperTrading({
             className="algo-btn algo-btn--refresh"
             disabled={busy}
             onClick={testAlert}
-            title={alertsOn ? "Send a test message to Telegram" : "Telegram is not configured on the server"}
+            title={alertsOn ? "Send a test alert to Telegram / email" : "No alert channel is configured on the server"}
           >
             {alertsOn ? "Test alert" : "Alerts off"}
           </button>

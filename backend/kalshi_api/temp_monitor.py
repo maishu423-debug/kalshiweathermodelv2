@@ -14,6 +14,8 @@ from weather.asos_client import fetch_recent_observations
 from weather.asos_nowcast import STATUS_UNAVAILABLE, freshness_status, todays_high
 from weather.asos_parser import parse_utc
 
+from .nws import resolve_known_high
+
 POLL_INTERVAL = 60
 
 _lock = threading.Lock()
@@ -35,7 +37,8 @@ def fetch_current_high():
     age = max(0.0, (now - parse_utc(latest["observed_at"])).total_seconds())
     return {
         "t0_f": latest["temp_f"],
-        "today_high_f": todays_high(observations, now)["high_f"],
+        # best provable high: the NOAA 5-minute high as a range, raised by the NWS hourly / DSM highs
+        "today_high_f": resolve_known_high(todays_high(observations, now)["high_f"], now),
         "observed_at": latest["observed_at"],
         "source": wcfg.SOURCE_ID,
         "status": freshness_status(age),

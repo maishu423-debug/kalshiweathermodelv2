@@ -15,6 +15,8 @@ NO SELLING:   Contracts are held until Kalshi settles the market.
 from collections import defaultdict
 from datetime import datetime, timezone
 
+from weather.asos_resolution import lower_bound_whole_f
+
 from .forecast import get_forecast_cache
 from .price_tracker import get_all_velocities, get_temp_snapshot, nws_round_temp_f
 
@@ -47,8 +49,14 @@ def hours_to_cutoff() -> float:
 
 
 def _nws_known_high_f(*values) -> int | None:
-    rounded = [nws_round_temp_f(v) for v in values if v is not None]
-    return max(rounded) if rounded else None
+    """
+    The highest whole-degree-F value we can prove the day has reached, from readings in F. A whole-degree-C reading
+    (the NOAA 5-minute feed) only narrows the true value to one or two whole-F values (87.8F is 87 or 88), so the
+    lowest is used: a bucket that is still alive is never marked dead. Readings with tenths, and whole-F bounds
+    (NWS hourly / DSM), are exact. See weather/asos_resolution.py.
+    """
+    bounds = [lower_bound_whole_f(v) for v in values if v is not None]
+    return max(bounds) if bounds else None
 
 
 # ── Step 1: same-horizon ensemble PDFs ───────────────────────────────────────

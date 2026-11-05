@@ -16,6 +16,8 @@ from collections import defaultdict, deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from weather.asos_resolution import lower_bound_whole_f
+
 _lock = threading.Lock()
 
 # ticker → deque of {ts, yes_bid, yes_ask}
@@ -57,13 +59,16 @@ def update_temp(temp_f: float):
     global _current_f, _daily_high_f, _date_str
     if temp_f is None:
         return
+    # The feed reports whole degrees C, so 87.8F may really be 87F: the recorded HIGH advances to the lowest value
+    # the reading can mean (the displayed current temperature stays as reported).
+    provable = float(lower_bound_whole_f(temp_f))
     with _lock:
         today = _today_key()
         if _date_str != today:
             _date_str = today
-            _daily_high_f = temp_f   # reset for new day — don't carry yesterday's high
-        elif _daily_high_f is None or temp_f > _daily_high_f:
-            _daily_high_f = temp_f
+            _daily_high_f = provable   # reset for new day — don't carry yesterday's high
+        elif _daily_high_f is None or provable > _daily_high_f:
+            _daily_high_f = provable
         _current_f = temp_f
 
 

@@ -114,6 +114,8 @@ def _fetch_hfmetar_shared():
     and the models must not run (they would otherwise fall back to a different provider).
     """
     from weather import build_live_shared_input
+
+    from .nws import resolve_known_high
     from weather.asos_nowcast import STATUS_UNAVAILABLE, build_future_features
     from weather.asos_parser import parse_utc
 
@@ -158,7 +160,8 @@ def _fetch_hfmetar_shared():
         "curr_raw": curr_raw,
         "fore_raw": fore_raw,
         "asos_current": {"t0_f": float(cur["temp_f"]),
-                         "today_high_f": (shared.get("today") or {}).get("high_f"),
+                         # best provable high: the NOAA 5-minute high as a range, raised by the NWS hourly / DSM highs
+                         "today_high_f": resolve_known_high((shared.get("today") or {}).get("high_f")),
                          "observed_at": cur["observed_at"],
                          # Live pressure tendency (hPa/h) so the models don't reuse a stale cached value.
                          "pressure_trend_hpa_per_hr": (shared.get("features") or {}).get("pressure_trend_hpa_per_hr"),

@@ -26,3 +26,7 @@ live_trader/trade_state.json
 
 # runtime forecast-vs-actual log (backend/kalshi_api/forecast_log.py)
 backend/forecast_log.csv
+
+# LDM vs public comparison logs and reports
+backend/logs/
+backend/modelscripts/asos_last_good.json

@@ -8,6 +8,8 @@ class KalshiApiConfig(AppConfig):
     def ready(self):
         import os
 
+        from . import checks  # noqa: F401  (registers the weather-source configuration check)
+
         # RUN_MAIN is set by Django's local autoreloader. Railway explicitly
         # enables the tasks with RUN_BACKGROUND_TASKS. Production must use one
         # Gunicorn worker/replica so that only one copy of each task is started.

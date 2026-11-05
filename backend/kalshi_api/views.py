@@ -23,6 +23,129 @@ def health(_request):
 
 
 @require_GET
+def weather_source_health(request):
+    """
+    Which live weather source is active, how fresh its newest observation is, and (if ASOS_SHADOW_COMPARE is on)
+    how it compares with the other source. Read-only; contains no credentials (only the API host name).
+    `?live=1` also pings the LDM API's /health.
+    """
+    from urllib.parse import urlsplit
+
+    from weather import asos_client, asos_shadow, config as wcfg
+    from weather.asos_nowcast import freshness_status
+    from weather.ldm_client import LdmApi, load_ldm_config, validate_source_config
+
+    try:
+        source = wcfg.get_asos_source()
+    except wcfg.AsosConfigError:
+        source = None
+    feed = asos_client.get_feed()
+    with feed.lock:
+        info = dict(feed.last_poll or {})
+        last_good = dict(feed.last_good) if feed.last_good else None
+    latency = info.get("latency") or {}
+    age = latency.get("observation_age_seconds")
+    data = {
+        "configured_source": source,
+        "config_problems": validate_source_config(),
+        "station": wcfg.ASOS_STATION,
+        "last_poll": {
+            "at": info.get("poll_started_at"),
+            "source": info.get("source"),
+            "success": info.get("last_poll_success"),
+            "source_status": info.get("source_status"),
+            "error_category": info.get("source_error_category"),
+            "errors": [str(e)[:300] for e in info.get("errors", [])][:10],
+            "ldm_listing_ms": info.get("ldm_listing_ms"),
+            "ldm_missing_hours": info.get("ldm_missing_hours", []),
+            "backfilled_from_public": info.get("backfilled_from_public", []),
+            "coverage_missing_hours": info.get("coverage_missing_hours", []),
+        },
+        "latest_observation": {
+            "observed_at": last_good["observed_at"] if last_good else None,
+            "temp_f": last_good["temp_f"] if last_good else None,
+            "age_seconds": age,
+            "freshness": freshness_status(age),
+        },
+        "latency": latency or None,
+        "shadow": {"enabled": asos_shadow.enabled(), **asos_shadow.summary()},
+    }
+    if source == wcfg.ASOS_SOURCE_LDM:
+        try:
+            conf = load_ldm_config()
+            data["ldm_host"] = urlsplit(conf.base_url).netloc
+            if request.GET.get("live") == "1":
+                data["ldm_health"] = LdmApi(conf).health()
+        except wcfg.AsosConfigError:
+            pass
+    return JsonResponse(data)
+
+
+_report_tool = None
+
+
+def _load_report_tool():
+    """tools/ldm_vs_public_report.py is a standalone script (not a package); load it once on first use."""
+    global _report_tool
+    if _report_tool is None:
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parent.parent / "tools" / "ldm_vs_public_report.py"
+        spec = importlib.util.spec_from_file_location("ldm_vs_public_report", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _report_tool = module
+    return _report_tool
+
+
+@require_GET
+def weather_source_report(request):
+    """
+    The LDM-vs-public comparison report, built on the server from the logs it writes
+    (ASOS_ARRIVAL_LOG_PATH and ASOS_SHADOW_LOG_PATH).
+
+      /api/kalshi/weather/report/                  HTML report for today (Miami date)
+      /api/kalshi/weather/report/?date=2026-10-29  a given Miami day
+      /api/kalshi/weather/report/?all=1            everything in the logs
+      /api/kalshi/weather/report/?format=json      the numbers behind it
+
+    Read-only. It contains observation timings and temperatures only, never credentials.
+    """
+    import re
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from django.http import HttpResponse
+    from weather import config as wcfg
+
+    arrivals_path = wcfg.resolve_log_path(os.environ.get("ASOS_ARRIVAL_LOG_PATH"))
+    shadow_path = wcfg.resolve_log_path(os.environ.get("ASOS_SHADOW_LOG_PATH"))
+    if arrivals_path is None:
+        return JsonResponse({
+            "error": "No arrival log is configured, so there is nothing to report on.",
+            "fix": "Set ASOS_ARRIVAL_LOG_PATH (e.g. /data/logs/asos_arrivals.jsonl) and ASOS_SHADOW_COMPARE=true on the backend, then redeploy.",
+        }, status=404)
+
+    date = request.GET.get("date")
+    if request.GET.get("all"):
+        date = None
+    elif not date:
+        date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    elif not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        return JsonResponse({"error": "date must look like 2026-10-29"}, status=400)
+
+    tool = _load_report_tool()
+    report = tool.build_report(tool.load_jsonl(arrivals_path), tool.load_jsonl(shadow_path), date=date)
+    report["log_files"] = {"arrivals": str(arrivals_path), "arrivals_found": arrivals_path.exists(),
+                           "shadow": str(shadow_path) if shadow_path else None,
+                           "shadow_found": bool(shadow_path and shadow_path.exists())}
+    if request.GET.get("format") == "json":
+        return JsonResponse(report, json_dumps_params={"default": str})
+    return HttpResponse(tool.render_html(report), content_type="text/html; charset=utf-8")
+
+
+@require_GET
 def debug_pem(_request):
     import os
     from cryptography.hazmat.primitives import serialization

@@ -18,6 +18,13 @@ Reliability rules (AsosFeed):
   * A downloaded file only replaces/extends the cache after HTTP success,
     gzip decompression, netCDF decoding and record extraction all succeed.
     Cached records are merged by observation time, so they never shrink.
+
+Two interchangeable transports feed the SAME decoder, parser and nowcast (ASOS_SOURCE):
+  public  the NOAA files above (default).
+  ldm     our private authenticated LDM API (ldm_client.py).  One cheap /files listing per poll says
+          which hourly snapshots changed (size + modified time); only changed snapshots are downloaded.
+          The snapshot's modified time is a cache key, never an observation time.
+Both keep the rules above; neither ever falls back to the other for current data.
 """
 import gzip
 import io
@@ -25,6 +32,8 @@ import json
 import logging
 import os
 import threading
+import time
+import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -37,6 +46,9 @@ from . import asos_parser, config as cfg
 log = logging.getLogger("weather.asos")
 
 _FILL_ABS = 1e30
+CACHE_KEEP_HOURS = 48
+ARRIVAL_LOG_MAX_BYTES = 20 * 1024 * 1024
+_arrival_lock = threading.Lock()
 STATE_PATH = Path(os.getenv("ASOS_STATE_PATH")
                   or Path(__file__).resolve().parent.parent / "modelscripts" / "asos_last_good.json")
 
@@ -141,15 +153,34 @@ def decode_hfmetar(raw_gz, station):
     return decode_hfmetar_ex(raw_gz, station)[0]
 
 
+def _classify_decode_error(exc):
+    """Why decode_hfmetar_ex failed: a broken gzip wrapper, or a payload that is not a readable netCDF."""
+    return "bad_gzip" if isinstance(exc, (gzip.BadGzipFile, EOFError, zlib.error)) else "bad_netcdf"
+
+
 # ── feed state ──────────────────────────────────────────────────────────────
 
 class AsosFeed:
     """Stateful MADIS HFMETAR poller: per-file record cache + persisted last-good observation."""
 
-    def __init__(self, state_path=None):
+    def __init__(self, state_path=None, source=None, ldm=None, persist=True, public_http=None):
+        """
+        source      'public' | 'ldm' | None (None = read ASOS_SOURCE at every poll)
+        ldm         an LdmApi (tests); None = build one from the environment when needed
+        persist     False = never read or write the last-good file (used by the shadow comparison)
+        public_http object with .get() used for public NOAA files (default: requests)
+        """
         self.lock = threading.RLock()
         self.state_path = Path(state_path) if state_path else STATE_PATH
-        self.cache = {}              # filename -> {"last_modified", "records", "final"}
+        self.source = source
+        self.persist = persist
+        self._ldm = ldm
+        self._ldm_cfg_key = None
+        self.public_http = public_http
+        self._ldm_auto = None
+        self.latest_receipt = None   # when/how the current last-good observation first reached us
+        self._advances = 0           # how many times last-good advanced in this process (arrival log: startup flag)
+        self.cache = {}              # hour-file name -> {"last_modified", "records", "final", + origin/version/timing}
         self.last_good = None        # newest successfully decoded normalized KMIA observation
         self.last_poll = None        # info dict of the most recent poll
         self.failed_at = {}          # filename -> time of last failed fetch (backoff for old hours)
@@ -161,6 +192,8 @@ class AsosFeed:
         if self._state_loaded:
             return
         self._state_loaded = True
+        if not self.persist:
+            return
         try:
             data = json.loads(self.state_path.read_text(encoding="utf-8"))
             obs = data.get("last_good")
@@ -178,6 +211,8 @@ class AsosFeed:
             log.warning("could not read persisted ASOS state %s: %s", self.state_path, exc)
 
     def _save_state(self):
+        if not self.persist:
+            return
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.state_path.with_suffix(".tmp")
@@ -207,7 +242,9 @@ class AsosFeed:
         if entry and entry.get("last_modified"):
             headers["If-Modified-Since"] = entry["last_modified"]
         try:
+            t_download = time.perf_counter()
             resp = http.get(cfg.MADIS_HFMETAR_URL + name, headers=headers, timeout=cfg.HTTP_TIMEOUT_SEC)
+            download_ms = round((time.perf_counter() - t_download) * 1000, 1)
             res["http_status"] = resp.status_code
             if resp.status_code == 304 and entry:
                 res["kmia_records"] = len(entry["records"])
@@ -218,7 +255,9 @@ class AsosFeed:
             resp.raise_for_status()
             content = resp.content
             res["bytes"] = len(content)
+            t_parse = time.perf_counter()
             records, total = decode_hfmetar_ex(content, cfg.ASOS_STATION)   # raises on corrupt gzip/netCDF
+            parse_ms = round((time.perf_counter() - t_parse) * 1000, 1)
             res["decoded_records"] = total
             if total == 0:
                 raise ValueError("file decoded but contains no records")
@@ -228,8 +267,11 @@ class AsosFeed:
                 "last_modified": resp.headers.get("Last-Modified"),
                 "records": [merged[k] for k in sorted(merged)],
                 "final": (now - hs) >= timedelta(hours=2),
+                "origin": "public", "snapshot": name, "version": resp.headers.get("Last-Modified"),
+                "received_at": now.isoformat(), "download_ms": download_ms, "parse_ms": parse_ms,
             }
             res["kmia_records"] = len(self.cache[name]["records"])
+            res["origin"] = "public"
             self.failed_at.pop(name, None)
         except Exception as exc:
             self.failed_at[name] = now
@@ -239,8 +281,143 @@ class AsosFeed:
                 res["kmia_records"] = len(entry["records"])
         return res
 
+    # -- source selection -----------------------------------------------------
+    def _resolve_source(self):
+        return self.source or cfg.get_asos_source()          # may raise AsosConfigError
+
+    def _ldm_api(self, session=None):
+        """LdmApi for the current environment; rebuilt only when the LDM settings change (keeps the TLS session)."""
+        if self._ldm is not None:
+            return self._ldm
+        from . import ldm_client
+        conf = ldm_client.load_ldm_config()                  # may raise AsosConfigError — before any request
+        key = (conf.base_url, conf.token, conf.timeout, conf.max_retries, conf.backfill_public)
+        if self._ldm_cfg_key != key:
+            self._ldm_auto = ldm_client.LdmApi(conf, session=session)
+            self._ldm_cfg_key = key
+        return self._ldm_auto
+
+    # -- one hourly snapshot from the LDM API ---------------------------------
+    def _fetch_file_ldm(self, api, name, hs, meta, now, deadline):
+        """Update the cache for one hour from the LDM API. Returns a per-file result dict (never raises)."""
+        from . import ldm_client
+        res = {"file": name, "http_status": None, "bytes": 0, "decoded_records": None, "kmia_records": 0,
+               "error": None, "origin": "ldm", "snapshot": meta.name, "version": meta.version}
+        entry = self.cache.get(name)
+        # The same filename is republished as NOAA updates it, so the filename alone proves nothing:
+        # the snapshot is reused only while its version (size + modified time) is exactly what we parsed.
+        if (entry and entry.get("origin") == "ldm" and meta.version is not None
+                and entry.get("version") == meta.version):
+            res.update(http_status="cached", kmia_records=len(entry["records"]))
+            return res
+        is_recent = (now - hs) < timedelta(hours=cfg.MADIS_REFRESH_RECENT_HOURS)
+        last_fail = self.failed_at.get(name)
+        if not is_recent and last_fail and (now - last_fail) < timedelta(minutes=5):
+            res.update(http_status="backoff", kmia_records=len(entry["records"]) if entry else 0)
+            return res
+        try:
+            content, download_ms, digest = api.download(meta, deadline)
+            res.update(http_status=200, bytes=len(content))
+            t_parse = time.perf_counter()
+            try:
+                records, total = decode_hfmetar_ex(content, cfg.ASOS_STATION)   # the existing decoder, unchanged
+            except Exception as exc:
+                raise ldm_client.LdmError(
+                    _classify_decode_error(exc), f"{meta.name}: {type(exc).__name__}: {exc}"[:200]) from None
+            parse_ms = round((time.perf_counter() - t_parse) * 1000, 1)
+            res["decoded_records"] = total
+            if total == 0:
+                raise ldm_client.LdmError("empty_dataset", f"{meta.name}: decoded but contains no records")
+            if not records:
+                res["note"] = "no_station_records"
+                log.warning("LDM %s decoded %d records but none for %s", meta.name, total, cfg.ASOS_STATION)
+            merged = {r["observation_time"]: r for r in (entry["records"] if entry else [])}
+            merged.update({r["observation_time"]: r for r in records})   # a corrected record replaces the old one
+            self.cache[name] = {
+                "last_modified": None,
+                "records": [merged[k] for k in sorted(merged)],
+                "final": (now - hs) >= timedelta(hours=2),
+                "origin": "ldm", "snapshot": meta.name, "version": meta.version, "sha256": digest,
+                "received_at": now.isoformat(), "download_ms": download_ms, "parse_ms": parse_ms,
+            }
+            res["kmia_records"] = len(self.cache[name]["records"])
+            self.failed_at.pop(name, None)
+        except ldm_client.LdmError as exc:
+            self.failed_at[name] = now
+            res["error"] = f"[{exc.category}] {exc}"
+            res["error_category"] = exc.category
+            log.warning("LDM %s failed (%s); keeping previous cache/last-good", name, res["error"])
+            if entry:
+                res["kmia_records"] = len(entry["records"])
+        except Exception as exc:
+            self.failed_at[name] = now
+            res["error"] = f"{type(exc).__name__}: {exc}"
+            log.warning("LDM %s failed (%s); keeping previous cache/last-good", name, res["error"])
+            if entry:
+                res["kmia_records"] = len(entry["records"])
+        return res
+
+    def _fetch_hours_ldm(self, hour_starts, must, now, info, session):
+        """One /files listing, then download only the snapshots whose version changed."""
+        from . import ldm_client
+        try:
+            api = self._ldm_api(session)
+        except cfg.AsosConfigError as exc:
+            info["errors"].append(f"configuration: {exc}")
+            info["config_error"] = True
+            info["source_error_category"] = "config"
+            return
+        deadline = ldm_client.Deadline()
+        try:
+            listing, info["ldm_listing_ms"] = api.list_files(deadline)
+        except ldm_client.LdmError as exc:
+            info["errors"].append(f"LDM listing: [{exc.category}] {exc}")
+            info["source_error_category"] = exc.category
+            log.warning("LDM listing failed (%s); keeping cache/last-good", exc.category)
+            return
+        info["ldm_files_listed"] = len(listing)
+        missing, backfilled = [], []
+        for hs in hour_starts:
+            name = file_name(hs)
+            info["requested_files"].append(name)
+            meta = listing.get(hs)
+            if meta is not None:
+                res = self._fetch_file_ldm(api, name, hs, meta, now, deadline)
+            elif hs not in must and api.config.backfill_public:
+                # An old hour the LDM API no longer holds: needed so the day's recorded high is complete.
+                res = self._fetch_file(name, hs, now, self.public_http or requests)
+                backfilled.append(name)
+                if res.get("http_status") == 404 and name not in self.cache:
+                    self.failed_at[name] = now          # not on NOAA either: back off instead of asking every poll
+            else:
+                # Not published (yet) / not retained: not an error, keep whatever is cached. Never substituted
+                # for the current or previous hour.
+                entry = self.cache.get(name)
+                res = {"file": name, "http_status": 404, "bytes": 0, "decoded_records": None,
+                       "kmia_records": len(entry["records"]) if entry else 0, "error": None,
+                       "origin": "ldm", "note": "not_in_ldm_listing"}
+                missing.append(name)
+            info["file_results"].append(res)
+            if res["error"]:
+                info["errors"].append(f"{res.get('origin', 'LDM')} {name}: {res['error']}")
+            elif res["http_status"] in (200, 304, "cached"):
+                info["files"].append(name)
+        info["ldm_missing_hours"] = missing
+        info["backfilled_from_public"] = backfilled
+
+    def _prune_cache(self, now):
+        """Bound the cache: hours older than CACHE_KEEP_HOURS can never matter to the nowcast or the daily high."""
+        from .ldm_client import hour_from_name
+        limit = now - timedelta(hours=CACHE_KEEP_HOURS)
+        for name in list(self.cache):
+            hour = hour_from_name(name)
+            if hour is not None and hour < limit:
+                del self.cache[name]
+                self.failed_at.pop(name, None)
+
     # -- poll ---------------------------------------------------------------
-    def poll(self, lookback_hours=cfg.ASOS_LOOKBACK_HOURS, now=None, session=None, reuse_seconds=0):
+    def poll(self, lookback_hours=cfg.ASOS_LOOKBACK_HOURS, now=None, session=None, reuse_seconds=0,
+             recent_only=False):
         """
         Returns (observations, info).  observations: QC'd, de-duplicated, ascending UTC KMIA
         public-5-minute observations built from the cached records plus last-good; never emptier
@@ -248,9 +425,10 @@ class AsosFeed:
 
         reuse_seconds > 0: if NOAA was already contacted that recently, do not contact it again;
         answer from the cache (keeps secondary callers from polling NOAA aggressively).
+        recent_only: only the current and previous UTC hour (used by the shadow comparison).
+        session: HTTP session for the configured source (tests; default requests / our own session).
         """
         now = now or datetime.now(timezone.utc)
-        http = session or requests
         with self.lock:
             self._load_state(now)
             if (reuse_seconds and self._last_fetch_at and self.last_poll is not None
@@ -266,15 +444,33 @@ class AsosFeed:
             must = {cur_hour, cur_hour - timedelta(hours=1)}           # current + previous UTC hour, always
             info["current_file"] = file_name(cur_hour)
             info["previous_file"] = file_name(cur_hour - timedelta(hours=1))
-            for hs in sorted(set(hourly_files(now, hours)) | must):
-                name = file_name(hs)
-                res = self._fetch_file(name, hs, now, http)
-                info["requested_files"].append(name)
-                info["file_results"].append(res)
-                if res["error"]:
-                    info["errors"].append(f"MADIS {name}: {res['error']}")
-                elif res["http_status"] in (200, 304, "cached"):
-                    info["files"].append(name)
+            hour_starts = sorted(must) if recent_only else sorted(set(hourly_files(now, hours)) | must)
+            try:
+                source = self._resolve_source()
+            except cfg.AsosConfigError as exc:
+                source = None
+                info["errors"].append(f"configuration: {exc}")      # nothing is requested
+                info["config_error"] = True
+                info["source_error_category"] = "config"
+            info["source"] = source
+            if source == cfg.ASOS_SOURCE_LDM:
+                self._fetch_hours_ldm(hour_starts, must, now, info, session)
+            elif source == cfg.ASOS_SOURCE_PUBLIC:
+                http = session or self.public_http or requests
+                for hs in hour_starts:
+                    name = file_name(hs)
+                    res = self._fetch_file(name, hs, now, http)
+                    info["requested_files"].append(name)
+                    info["file_results"].append(res)
+                    if res["error"]:
+                        info["errors"].append(f"MADIS {name}: {res['error']}")
+                    elif res["http_status"] in (200, 304, "cached"):
+                        info["files"].append(name)
+            # Hours of the day we should hold but do not: a partial day would understate the recorded high.
+            if not recent_only:
+                info["coverage_missing_hours"] = [file_name(hs) for hs in hour_starts
+                                                  if file_name(hs) not in self.cache]
+            self._prune_cache(now)
             self._last_fetch_at = now
             info["last_poll_success"] = not info["errors"]
             observations = self._assemble(now, info, lookback_hours)
@@ -301,19 +497,120 @@ class AsosFeed:
                 info["sources"].append("MADIS_HFMETAR")
 
         info["cache_updated"] = False
-        if newest_downloaded is not None and (
-                self.last_good is None or asos_parser.parse_utc(newest_downloaded["observed_at"])
-                > asos_parser.parse_utc(self.last_good["observed_at"])):
+        advance, corrected = False, False
+        if newest_downloaded is not None:
+            if self.last_good is None:
+                advance = True
+            else:
+                new_t = asos_parser.parse_utc(newest_downloaded["observed_at"])
+                old_t = asos_parser.parse_utc(self.last_good["observed_at"])
+                if new_t > old_t:
+                    advance = True                      # a strictly newer observation
+                elif (new_t == old_t and newest_downloaded != self.last_good
+                      and asos_parser._completeness(newest_downloaded) >= asos_parser._completeness(self.last_good)):
+                    advance, corrected = True, True     # NOAA re-issued the same observation with changed values
+        if advance:
+            # Every observation that is new to this feed (a poll can bring several), for the arrival log.
+            prev_t = asos_parser.parse_utc(self.last_good["observed_at"]) if self.last_good else None
+            fresh = [newest_downloaded] if corrected else [
+                o for o in observations if prev_t is None or asos_parser.parse_utc(o["observed_at"]) > prev_t]
             self.last_good = newest_downloaded
             self._save_state()
             info["cache_updated"] = True
+            info["last_good_corrected"] = corrected
+            self._record_receipt(newest_downloaded, now, info)
+            self._log_arrivals(fresh, now, info, corrected)
         if self.last_good is not None:
             observations = asos_parser.deduplicate(observations + [self.last_good])
         info["last_good_observation"] = self.last_good["observed_at"] if self.last_good else None
         info["last_good_age_seconds"] = (
             round(max(0.0, (now - asos_parser.parse_utc(self.last_good["observed_at"])).total_seconds()), 1)
             if self.last_good else None)
+        info["latency"] = self._latency_report(now)
         return observations
+
+    # -- latency diagnostics --------------------------------------------------
+    def _entry_containing(self, obs_time):
+        """The cached snapshot that carries the observation at `obs_time` (the most recently received one)."""
+        entry = None
+        for e in self.cache.values():
+            if any(abs(r["observation_time"] - obs_time.timestamp()) < 1 for r in e["records"]):
+                if entry is None or (e.get("received_at") or "") >= (entry.get("received_at") or ""):
+                    entry = e
+        return entry or {}
+
+    def _log_arrivals(self, fresh, now, info, corrected):
+        """
+        Append one JSON line per newly delivered observation to ASOS_ARRIVAL_LOG_PATH (if set): when it reached this
+        feed, which snapshot carried it, how old it was. Used by tools/ldm_vs_public_report.py.
+        `startup` marks the first batch after the process started: those observations may have been available
+        long before we looked, so they are excluded from latency statistics.
+        """
+        startup = self._advances == 0
+        self._advances += 1
+        path = cfg.resolve_log_path(os.getenv("ASOS_ARRIVAL_LOG_PATH"))
+        if path is None or not fresh:
+            return
+        rows = []
+        for o in fresh:
+            obs_time = asos_parser.parse_utc(o["observed_at"])
+            entry = self._entry_containing(obs_time)
+            rows.append({
+                "logged_at": now.isoformat(),
+                "source": info.get("source") or entry.get("origin"),
+                "role": "primary" if self.persist else "shadow",
+                "observation_time_utc": o["observed_at"],
+                "backend_received_at_utc": now.isoformat(),
+                "age_at_receipt_seconds": round(max(0.0, (now - obs_time).total_seconds()), 1),
+                "temp_f": o.get("temp_f"),
+                "snapshot_filename": entry.get("snapshot"),
+                "snapshot_version": entry.get("version"),
+                "download_ms": entry.get("download_ms"),
+                "parse_ms": entry.get("parse_ms"),
+                "startup": startup,
+                "corrected": corrected,
+            })
+        try:
+            with _arrival_lock:
+                if path.exists() and path.stat().st_size > ARRIVAL_LOG_MAX_BYTES:
+                    return
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write("".join(json.dumps(r) + "\n" for r in rows))
+        except Exception as exc:
+            log.warning("could not write arrival log %s: %s", path, type(exc).__name__)
+
+    def _record_receipt(self, obs, now, info):
+        """Remember when/how the newest observation first reached us, and log it (never any credentials)."""
+        obs_time = asos_parser.parse_utc(obs["observed_at"])
+        entry = self._entry_containing(obs_time)
+        self.latest_receipt = {
+            "source_name": info.get("source") or entry.get("origin"),
+            "station_id": cfg.ASOS_STATION,
+            "observation_time_utc": obs["observed_at"],
+            "backend_received_at_utc": now.isoformat(),
+            "observation_age_at_receipt_seconds": round(max(0.0, (now - obs_time).total_seconds()), 1),
+            "snapshot_filename": entry.get("snapshot"),
+            "snapshot_version": entry.get("version"),
+            "download_duration_ms": entry.get("download_ms"),
+            "parse_duration_ms": entry.get("parse_ms"),
+        }
+        if self.persist:
+            line = " ".join(f"{k}={v}" for k, v in {
+                **self.latest_receipt,
+                "observation_age_seconds": self.latest_receipt["observation_age_at_receipt_seconds"],
+                "latest_valid_observation_time": obs["observed_at"],
+                "corrected": info.get("last_good_corrected", False)}.items())
+            print(f"[ASOS-LATENCY] {line}", flush=True)
+
+    def _latency_report(self, now):
+        """Current observation age plus how the newest observation arrived."""
+        if self.last_good is None:
+            return None
+        obs_time = asos_parser.parse_utc(self.last_good["observed_at"])
+        return {**(self.latest_receipt or {}),
+                "observation_age_seconds": round(max(0.0, (now - obs_time).total_seconds()), 1),
+                "latest_valid_observation_time": self.last_good["observed_at"]}
 
     def reset(self, state_path=None):
         with self.lock:
@@ -322,6 +619,8 @@ class AsosFeed:
             self.last_poll = None
             self.failed_at.clear()
             self._last_fetch_at = None
+            self.latest_receipt = None
+            self._advances = 0
             self._state_loaded = False
             if state_path is not None:
                 self.state_path = Path(state_path)
@@ -336,7 +635,15 @@ def get_feed():
 
 
 def fetch_recent_observations(lookback_hours=cfg.ASOS_LOOKBACK_HOURS, now=None, session=None, reuse_seconds=0):
-    return _feed.poll(lookback_hours=lookback_hours, now=now, session=session, reuse_seconds=reuse_seconds)
+    observations, info = _feed.poll(lookback_hours=lookback_hours, now=now, session=session,
+                                    reuse_seconds=reuse_seconds)
+    # Optional shadow comparison (ASOS_SHADOW_COMPARE): observes only, on its own thread, never raises.
+    try:
+        from . import asos_shadow
+        asos_shadow.notify(info.get("source"), observations, info, now)
+    except Exception:
+        pass
+    return observations, info
 
 
 def get_latest_asos_observation(station_id=None, now=None, session=None, poll=True, reuse_seconds=0):
@@ -401,6 +708,11 @@ def diagnostics(now=None, observations=None, info=None, n_recent=10):
     return {
         "station": cfg.ASOS_STATION,
         "source": cfg.SOURCE_ID,
+        "transport": info.get("source"),              # 'public' | 'ldm' (None = configuration error)
+        "latency": info.get("latency"),
+        "source_error_category": info.get("source_error_category"),
+        "coverage_missing_hours": info.get("coverage_missing_hours", []),
+        "backfilled_from_public": info.get("backfilled_from_public", []),
         "server_checked_at": now.isoformat(),
         "last_poll_at": info.get("poll_started_at", now.isoformat()),
         "last_poll_success": info.get("last_poll_success", not info.get("errors")),

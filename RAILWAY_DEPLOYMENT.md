@@ -73,6 +73,93 @@ GOOGLE_TRADES_SHEET_ID=
 
 The Google service-account email must have access to the selected sheets.
 
+### Live weather source: private NOAA MADIS LDM API
+
+The live KMIA observations (HFMETAR) can come from NOAA's public files (the original source) or from our private
+LDM receiver, served over authenticated HTTPS. Both feed the same decoder, parser, QC and nowcast.
+
+```env
+ASOS_SOURCE=ldm                              # ldm | public   (unset = public)
+LDM_API_BASE_URL=https://data.getedgefront.com
+LDM_API_TOKEN=<secret>
+LDM_API_TIMEOUT_SECONDS=15
+ASOS_SHADOW_COMPARE=false                    # true = also fetch the other source, compare, record
+```
+
+Optional tuning (defaults shown):
+
+```env
+LDM_API_MAX_RETRIES=2                        # retries of a transient failure (timeout, 5xx, 429)
+LDM_BACKFILL_PUBLIC=true                     # see "Day coverage" below
+ASOS_SHADOW_MIN_INTERVAL_SECONDS=60
+ASOS_SHADOW_LOG_PATH=                        # e.g. /data/asos_shadow.jsonl to keep every comparison
+```
+
+**The token belongs only in the Backend service's environment.** Never put it in a Frontend variable (`NEXT_PUBLIC_*`,
+`VITE_*`, ...), the repository, a log or a screenshot. The backend never returns it from any endpoint.
+
+Rules the code enforces:
+
+- `ASOS_SOURCE=ldm` without `LDM_API_TOKEN` is a configuration error. `python manage.py migrate` (part of the start
+  command) fails with `weather.E001`, so a bad deploy never goes live. Requests are never sent without the token, and
+  there is no silent fallback to the public source.
+- Each poll makes one `/api/v1/hfmetar/files` listing request, then downloads only the hourly snapshots whose version
+  (size + modified time) changed. The same filename is re-published as NOAA updates it, so the filename alone is not
+  trusted. The snapshot's modified time is only a cache key, never an observation time.
+- Freshness is judged from the observation's own time (fresh < 15 min, delayed < 25 min, unavailable beyond that),
+  never from whether a request succeeded. A failed or invalid download never overwrites the last good observation
+  (`asos_last_good.json`).
+- **Day coverage:** the recorded daily high needs every hour since Miami midnight. Hours the LDM API no longer holds
+  are fetched once from NOAA's public files (`LDM_BACKFILL_PUBLIC=true`, listed in `backfilled_from_public`). The
+  current and previous hour are never substituted. With `LDM_BACKFILL_PUBLIC=false`, missing hours are listed in
+  `coverage_missing_hours` and the recorded high may be understated, so confirm how many hours the API retains first.
+
+**LDM vs public comparison report.** To record the data the report needs, set these on the Backend (the volume keeps
+the logs across redeploys) and redeploy:
+
+```env
+ASOS_SHADOW_COMPARE=true
+ASOS_SHADOW_MIN_INTERVAL_SECONDS=45
+ASOS_ARRIVAL_LOG_PATH=/data/logs/asos_arrivals.jsonl
+ASOS_SHADOW_LOG_PATH=/data/logs/asos_shadow.jsonl
+```
+
+Then open the report in a browser (it is built on the server from those logs; it shows observation timings and
+temperatures only, never credentials):
+
+```text
+https://YOUR-FRONTEND-DOMAIN/api/kalshi/weather/report/                    # today (Miami date)
+https://YOUR-FRONTEND-DOMAIN/api/kalshi/weather/report/?date=2026-10-29    # a given Miami day
+https://YOUR-FRONTEND-DOMAIN/api/kalshi/weather/report/?all=1              # everything logged
+https://YOUR-FRONTEND-DOMAIN/api/kalshi/weather/report/?format=json        # the numbers behind it
+```
+
+It reports 404 with the missing setting if `ASOS_ARRIVAL_LOG_PATH` is not set, and a "no arrival data" notice if the
+log has nothing for the chosen day. Logging only starts after the deploy, and the first batch after each restart is
+excluded from the statistics, so allow a few hours (ideally a full day) before reading conclusions into it.
+
+Verify source health (no credentials needed or shown):
+
+```text
+https://YOUR-FRONTEND-DOMAIN/api/kalshi/weather/source/          # add ?live=1 to also ping the LDM /health
+```
+
+Check `configured_source`, `config_problems` (empty), `last_poll.success`, `last_poll.error_category`,
+`latest_observation.age_seconds` and `latest_observation.freshness`. The backend log prints one
+`[ASOS-LATENCY]` line per new observation (source, observation time, time received, observation age at receipt,
+snapshot filename/version, download and parse milliseconds). With `ASOS_SHADOW_COMPARE=true` it also prints
+`[ASOS-SHADOW]` lines and the endpoint adds a `shadow` section (which source is newer, median ages, temperature
+differences, errors per source). The shadow only observes: it never changes forecasts or trading.
+
+**Roll back to NOAA's public files** by changing one variable and letting Railway redeploy, no rebuild:
+
+```env
+ASOS_SOURCE=public
+```
+
+Rollout suggestion: deploy with `ASOS_SOURCE=public` and `ASOS_SHADOW_COMPARE=true` plus the LDM variables, compare for
+a day or two on the health endpoint, then set `ASOS_SOURCE=ldm`.
+
 ## 4. Configure Frontend variables
 
 ```env

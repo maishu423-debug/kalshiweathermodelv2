@@ -5,6 +5,10 @@ from . import views
 
 urlpatterns = [
     path("health/", views.health),
+    path("weather/source",             views.weather_source_health),
+    path("weather/source/",            views.weather_source_health),
+    path("weather/report",             views.weather_source_report),
+    path("weather/report/",            views.weather_source_report),
     path("miami-temperature",         views.miami_temperature),
     path("miami-temperature/",        views.miami_temperature),
     path("miami-temperature/stream",  views.miami_temperature_stream),

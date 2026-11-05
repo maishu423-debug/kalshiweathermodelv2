@@ -79,3 +79,35 @@ POLL_EVERY_MINUTES = max(1, int(os.getenv("MADIS_POLL_MINUTES", "1")))
 # Slots: minute % POLL_EVERY_MINUTES == POLL_MINUTE_OFFSET % POLL_EVERY_MINUTES
 POLL_MINUTE_OFFSET = 1
 POLL_RETRY_SECONDS = 45
+
+# ── Live source selection (public NOAA vs. our private LDM API) ─────────────
+# ASOS_SOURCE=public (default, unchanged behaviour) | ldm (private LDM HTTPS API, see ldm_client.py).
+# Switching back is only an environment-variable change.
+ASOS_SOURCE_PUBLIC = "public"
+ASOS_SOURCE_LDM = "ldm"
+ASOS_SOURCES = (ASOS_SOURCE_PUBLIC, ASOS_SOURCE_LDM)
+
+
+class AsosConfigError(ValueError):
+    """The weather-source configuration is unusable. Always raised BEFORE any network request is made."""
+
+
+def get_asos_source(env=None):
+    """The configured live source ('public' or 'ldm'). Unset means 'public'; anything else is an error."""
+    env = os.environ if env is None else env
+    value = (env.get("ASOS_SOURCE") or "").strip().lower() or ASOS_SOURCE_PUBLIC
+    if value not in ASOS_SOURCES:
+        raise AsosConfigError(
+            f"ASOS_SOURCE={value!r} is not valid. Use 'ldm' (private LDM API) or 'public' (NOAA public files).")
+    return value
+
+
+def resolve_log_path(raw):
+    """Path for an optional log file setting. Empty = disabled; a relative path is relative to the backend folder
+    (not the current directory), so the logs land in the same place however the server is started."""
+    from pathlib import Path
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    return path if path.is_absolute() else Path(__file__).resolve().parent.parent / path

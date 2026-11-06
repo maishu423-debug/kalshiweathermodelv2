@@ -428,13 +428,6 @@ def get_ensemble_forecast(results=None) -> dict:
 
 # ── Master state ──────────────────────────────────────────────────────────────
 
-def _raw_high_for_display(raw_f, recorded_high):
-    """The unrounded high, only when it is consistent with the recorded (rounded) high; otherwise None."""
-    if raw_f is None or recorded_high is None:
-        return None
-    return round(raw_f, 2) if nws_round_temp_f(raw_f) == recorded_high else None
-
-
 def get_full_state(markets: list, paper_state=None, enabled_models=None) -> dict:
     cache       = get_forecast_cache()
     all_results = cache.get("results", {})
@@ -498,6 +491,14 @@ def get_full_state(markets: list, paper_state=None, enabled_models=None) -> dict
     h_rem = int(cutoff_h)
     m_rem = int((cutoff_h - h_rem) * 60)
     recorded_high = nws_round_temp_f(nws_temp["daily_high_f"]) if nws_temp["daily_high_f"] is not None else None
+    raw_high = nws_temp.get("daily_high_raw_f")
+    # What the PAGE shows as the recorded high: the hottest reading (5-minute feed and NWS hourly reports) rounded
+    # half-up (80.6 -> 81), but never below a value we have proven (an exact NWS hourly / DSM whole-degree high).
+    # Display only: the bot keeps using `recorded_high`, the lowest provable value.
+    if recorded_high is None or raw_high is None:
+        display_high = recorded_high
+    else:
+        display_high = max(recorded_high, nws_round_temp_f(raw_high))
 
     return {
         "forecast": {
@@ -510,10 +511,10 @@ def get_full_state(markets: list, paper_state=None, enabled_models=None) -> dict
         "temp": {
             "current_f":    round(nws_temp["current_f"],    1) if nws_temp["current_f"]    is not None else None,
             "daily_high_f": recorded_high,
-            # the hottest reading today before rounding, shown next to the recorded high (84.9 beside 85), but ONLY when
-            # it rounds to that high: the 5-minute feed is whole degrees C, so a DSM / NWS-hourly based high can sit a
-            # degree above the feed's own value, and showing both would contradict each other
-            "daily_high_raw_f": _raw_high_for_display(nws_temp.get("daily_high_raw_f"), recorded_high),
+            "daily_high_display_f": display_high,
+            # the hottest reading today before rounding, shown next to the recorded high and labelled "feed" on the page.
+            # The 5-minute feed is whole degrees C, so it can sit a degree away from the (exact / lowest provable) high.
+            "daily_high_raw_f": round(nws_temp["daily_high_raw_f"], 2) if nws_temp.get("daily_high_raw_f") is not None else None,
         },
         "analysis":       analyses,
         "recommendation": recommendation,

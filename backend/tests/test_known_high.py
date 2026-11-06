@@ -329,7 +329,8 @@ def test_the_page_data_carries_the_rounded_and_the_unrounded_high(monkeypatch):
     monkeypatch.setattr(alg, "get_temp_snapshot",
                         lambda: {"current_f": 84.2, "daily_high_f": 85.0, "daily_high_raw_f": 84.92})
     monkeypatch.setattr(alg, "get_forecast_cache", lambda: {"results": {}})
-    assert alg.get_full_state([])["temp"] == {"current_f": 84.2, "daily_high_f": 85, "daily_high_raw_f": 84.92}
+    assert alg.get_full_state([])["temp"] == {"current_f": 84.2, "daily_high_f": 85, "daily_high_display_f": 85,
+                                                  "daily_high_raw_f": 84.92}
     monkeypatch.setattr(alg, "get_temp_snapshot", lambda: {"current_f": 84.2, "daily_high_f": 85.0})
     assert alg.get_full_state([])["temp"]["daily_high_raw_f"] is None       # older snapshots without it still work
 
@@ -372,24 +373,62 @@ def test_model_input_carries_the_raw_high(monkeypatch):
     assert pt.get_temp_snapshot()["daily_high_raw_f"] == pytest.approx(84.92)
 
 
-# ── the unrounded value is only shown when it agrees with the recorded (rounded) high ─────────────
+# ── the unrounded value always accompanies the recorded high (the page labels it "feed") ─────────
 
-@pytest.mark.parametrize("raw,recorded_f,shown", [
-    (84.92, 85.0, 84.92),     # 29.4C hourly report: rounds to the recorded 85, so both are shown
-    (85.4, 85.0, 85.4),
-    (75.2, 76.0, None),       # whole-C feed value (24C) beside a DSM-based 76: they disagree, so only 76 is shown
-    (87.8, 87.0, None),       # the bot uses the lowest provable value (87) while the feed value rounds to 88
-    (84.2, 84.0, 84.2),       # a whole-C value that does round to the recorded high is fine
+@pytest.mark.parametrize("raw,recorded_f,expected", [
+    (84.92, 85.0, 84.92),     # an NWS hourly report (29.4C) that rounds to the recorded 85
+    (80.6, 80.0, 80.6),       # whole-C feed value (27C): the bot's high is the lowest provable (80); the value is still shown
+    (75.2, 76.0, 75.2),       # DSM-based 76 beside the feed's 24C reading: shown, the page labels it as the feed's value
+    (87.8, 87.0, 87.8),
     (None, 85.0, None),
 ])
-def test_the_unrounded_value_is_shown_only_when_it_rounds_to_the_recorded_high(monkeypatch, raw, recorded_f, shown):
+def test_the_unrounded_value_is_always_passed_to_the_page(monkeypatch, raw, recorded_f, expected):
     from kalshi_api import algorithm as alg
 
     monkeypatch.setattr(alg, "get_temp_snapshot",
                         lambda: {"current_f": 80.0, "daily_high_f": recorded_f, "daily_high_raw_f": raw})
     monkeypatch.setattr(alg, "get_forecast_cache", lambda: {"results": {}})
     temp = alg.get_full_state([])["temp"]
-    assert temp["daily_high_f"] == int(recorded_f)
-    assert temp["daily_high_raw_f"] == shown
-    if shown is not None:
-        assert alg.nws_round_temp_f(temp["daily_high_raw_f"]) == temp["daily_high_f"]   # never contradicts the rounded value
+    assert temp["daily_high_f"] == int(recorded_f) and temp["daily_high_raw_f"] == expected
+
+
+# ── what the page shows as the recorded high: the hottest reading rounded half-up (display only) ──────────────
+
+@pytest.mark.parametrize("raw,bot_high_f,shown,bot_high", [
+    (80.6, 80.0, 81, 80),      # 27C feed reading: shown as 81 (80.6 rounds up); the bot keeps the lowest provable 80
+    (80.4, 80.0, 80, 80),      # below .5 rounds down
+    (80.5, 80.0, 81, 80),      # exactly .5 rounds up
+    (84.92, 85.0, 85, 85),     # NWS hourly report: both agree
+    (87.8, 87.0, 88, 87),      # feed 87.8 shows as 88; the bot uses 87
+    (84.2, 84.0, 84, 84),
+    (75.2, 76.0, 76, 76),      # a proven exact 76 (DSM / NWS hourly) is never shown below: 76, not round(75.2) = 75
+    (None, 85.0, 85, 85),      # no unrounded reading: just the high
+])
+def test_the_page_shows_the_hottest_reading_rounded_half_up_but_the_bot_high_is_unchanged(monkeypatch, raw, bot_high_f, shown, bot_high):
+    from kalshi_api import algorithm as alg
+
+    monkeypatch.setattr(alg, "get_temp_snapshot",
+                        lambda: {"current_f": 80.0, "daily_high_f": bot_high_f, "daily_high_raw_f": raw})
+    monkeypatch.setattr(alg, "get_forecast_cache", lambda: {"results": {}})
+    temp = alg.get_full_state([])["temp"]
+    assert temp["daily_high_display_f"] == shown          # what the page shows as Recorded High
+    assert temp["daily_high_f"] == bot_high               # the bot's own high (lowest provable) is not touched
+    assert temp["daily_high_raw_f"] == (None if raw is None else raw)
+
+
+def test_older_snapshots_without_the_raw_value_still_work(monkeypatch):
+    from kalshi_api import algorithm as alg
+
+    monkeypatch.setattr(alg, "get_temp_snapshot", lambda: {"current_f": 80.0, "daily_high_f": 80.0})
+    monkeypatch.setattr(alg, "get_forecast_cache", lambda: {"results": {}})
+    temp = alg.get_full_state([])["temp"]
+    assert temp["daily_high_display_f"] == 80 and temp["daily_high_raw_f"] is None
+
+
+def test_no_high_at_all_shows_nothing(monkeypatch):
+    from kalshi_api import algorithm as alg
+
+    monkeypatch.setattr(alg, "get_temp_snapshot", lambda: {"current_f": None, "daily_high_f": None, "daily_high_raw_f": None})
+    monkeypatch.setattr(alg, "get_forecast_cache", lambda: {"results": {}})
+    temp = alg.get_full_state([])["temp"]
+    assert temp["daily_high_display_f"] is None and temp["daily_high_f"] is None

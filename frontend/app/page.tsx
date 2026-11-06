@@ -85,7 +85,7 @@ type AlgorithmState = {
     running:     boolean;
     loop?:       { waiting_for_hfmetar?: { reason: string; since: string } | null } | null;
   };
-  temp:           { current_f: number | null; daily_high_f: number | null; daily_high_raw_f?: number | null };
+  temp:           { current_f: number | null; daily_high_f: number | null; daily_high_display_f?: number | null; daily_high_raw_f?: number | null };
   analysis:       MarketMomentum[];
   recommendation: Recommendation;
   time_to_cutoff: { hours: number; display: string };
@@ -549,7 +549,7 @@ export default function Home() {
   const ensemble    = algoState?.forecast?.ensemble;
   const modelsReady = algoState?.models_ready ?? false;
   const tempNow     = algoState?.temp?.current_f;
-  const tempHigh    = algoState?.temp?.daily_high_f;
+  const tempHigh    = algoState?.temp?.daily_high_display_f ?? algoState?.temp?.daily_high_f;
   const tempHighRaw = algoState?.temp?.daily_high_raw_f;
 
   return (
@@ -601,7 +601,7 @@ export default function Home() {
               <span className="algo-temp algo-temp--high">
                 Recorded High: {tempHigh}°F
                 {tempHighRaw != null && Math.abs(tempHighRaw - tempHigh) >= 0.05 && (
-                  <span className="algo-temp-raw" title="The hottest reading today before rounding"> ({tempHighRaw.toFixed(1)}°F)</span>
+                  <span className="algo-temp-raw" title="The hottest reading today before rounding, from the NOAA 5-minute feed or an NWS report. The feed is whole °C, so it can sit a degree away from the recorded high."> (feed {tempHighRaw.toFixed(1)}°F)</span>
                 )}
               </span>
             )}

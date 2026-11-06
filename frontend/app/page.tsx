@@ -601,7 +601,7 @@ export default function Home() {
               <span className="algo-temp algo-temp--high">
                 Recorded High: {tempHigh}°F
                 {tempHighRaw != null && Math.abs(tempHighRaw - tempHigh) >= 0.05 && (
-                  <span className="algo-temp-raw" title="The hottest unrounded reading today"> ({tempHighRaw.toFixed(1)}°F)</span>
+                  <span className="algo-temp-raw" title="The hottest reading today before rounding"> ({tempHighRaw.toFixed(1)}°F)</span>
                 )}
               </span>
             )}

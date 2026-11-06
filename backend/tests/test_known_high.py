@@ -370,3 +370,26 @@ def test_model_input_carries_the_raw_high(monkeypatch):
     assert data["asos_current"]["today_high_raw_f"] == pytest.approx(84.92)
     forecast._apply_asos_current(data["asos_current"])
     assert pt.get_temp_snapshot()["daily_high_raw_f"] == pytest.approx(84.92)
+
+
+# ── the unrounded value is only shown when it agrees with the recorded (rounded) high ─────────────
+
+@pytest.mark.parametrize("raw,recorded_f,shown", [
+    (84.92, 85.0, 84.92),     # 29.4C hourly report: rounds to the recorded 85, so both are shown
+    (85.4, 85.0, 85.4),
+    (75.2, 76.0, None),       # whole-C feed value (24C) beside a DSM-based 76: they disagree, so only 76 is shown
+    (87.8, 87.0, None),       # the bot uses the lowest provable value (87) while the feed value rounds to 88
+    (84.2, 84.0, 84.2),       # a whole-C value that does round to the recorded high is fine
+    (None, 85.0, None),
+])
+def test_the_unrounded_value_is_shown_only_when_it_rounds_to_the_recorded_high(monkeypatch, raw, recorded_f, shown):
+    from kalshi_api import algorithm as alg
+
+    monkeypatch.setattr(alg, "get_temp_snapshot",
+                        lambda: {"current_f": 80.0, "daily_high_f": recorded_f, "daily_high_raw_f": raw})
+    monkeypatch.setattr(alg, "get_forecast_cache", lambda: {"results": {}})
+    temp = alg.get_full_state([])["temp"]
+    assert temp["daily_high_f"] == int(recorded_f)
+    assert temp["daily_high_raw_f"] == shown
+    if shown is not None:
+        assert alg.nws_round_temp_f(temp["daily_high_raw_f"]) == temp["daily_high_f"]   # never contradicts the rounded value

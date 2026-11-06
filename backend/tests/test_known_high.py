@@ -269,3 +269,104 @@ def test_a_bucket_is_only_dead_when_the_day_has_provably_passed_it(monkeypatch):
     dead = {a["ticker"]: a["is_dead"] for a in alg.analyze_markets(markets)}
     # 84.2F could be 85F, but it could also be 84F: the 83-84 bucket is not provably lost, so it stays alive
     assert dead == {"b83": False, "b85": False}
+
+
+# ── the unrounded high, shown next to the recorded high ───────────────────────
+
+def test_the_raw_high_is_the_hottest_unrounded_reading(monkeypatch):
+    use_nws(monkeypatch, [reading(130, 29.4), reading(10, 29.0)])           # 29.4C = 84.92F, the 5-minute rows are 29C
+    high, raw = nws.resolve_known_high_detail(84.2, NOW)
+    assert high == 85.0 and raw == pytest.approx(84.92)                      # "85F" on screen, 84.9F beside it
+    assert nws.last_floor_decision()["raw_high_f"] == pytest.approx(84.92)
+
+
+def test_the_raw_high_without_the_nws_is_the_noaa_reading():
+    assert nws.resolve_known_high_detail(84.2, NOW) == (84.0, 84.2)
+
+
+def test_a_cooler_nws_reading_does_not_lower_the_raw_high(monkeypatch):
+    use_nws(monkeypatch, [reading(60, 28.9)])                                # 84.02F
+    assert nws.resolve_known_high_detail(87.8, NOW) == (87.0, 87.8)
+
+
+def test_no_high_means_no_raw_high():
+    assert nws.resolve_known_high_detail(None, NOW) == (None, None)
+
+
+def test_on_an_error_the_raw_high_is_the_input(monkeypatch):
+    use_dsm(monkeypatch, {"latest": {"high_f": "hot", "date": TODAY}})
+    assert nws.resolve_known_high_detail(84.2, NOW) == (84.2, 84.2)
+
+
+def test_resolve_known_high_still_returns_just_the_high(monkeypatch):
+    use_nws(monkeypatch, [reading(130, 29.4)])
+    assert nws.resolve_known_high(84.2, NOW) == 85.0
+
+
+def test_the_tracker_keeps_the_hottest_unrounded_reading_and_resets_each_day(monkeypatch):
+    from kalshi_api import price_tracker as pt
+
+    for name in ("_daily_high_f", "_date_str", "_current_f", "_daily_high_raw_f", "_raw_date_str"):
+        monkeypatch.setattr(pt, name, None)
+    pt.update_temp(84.2)                                                     # a reading is also a raw candidate
+    assert pt.get_temp_snapshot()["daily_high_raw_f"] == 84.2
+    pt.set_daily_high_raw(84.92)
+    assert pt.get_temp_snapshot()["daily_high_raw_f"] == 84.92
+    pt.set_daily_high_raw(80.0)
+    pt.update_temp(82.4)
+    assert pt.get_temp_snapshot()["daily_high_raw_f"] == 84.92              # never goes down within a day
+    pt.set_daily_high_raw(None)                                              # ignored
+    assert pt.get_temp_snapshot()["daily_high_raw_f"] == 84.92
+    monkeypatch.setattr(pt, "_today_key", lambda: "2099-01-01")              # the next day
+    assert pt.get_temp_snapshot()["daily_high_raw_f"] is None               # yesterday's value is not shown
+    pt.set_daily_high_raw(79.0)
+    assert pt.get_temp_snapshot()["daily_high_raw_f"] == 79.0               # and a new day starts fresh
+
+
+def test_the_page_data_carries_the_rounded_and_the_unrounded_high(monkeypatch):
+    from kalshi_api import algorithm as alg
+
+    monkeypatch.setattr(alg, "get_temp_snapshot",
+                        lambda: {"current_f": 84.2, "daily_high_f": 85.0, "daily_high_raw_f": 84.92})
+    monkeypatch.setattr(alg, "get_forecast_cache", lambda: {"results": {}})
+    assert alg.get_full_state([])["temp"] == {"current_f": 84.2, "daily_high_f": 85, "daily_high_raw_f": 84.92}
+    monkeypatch.setattr(alg, "get_temp_snapshot", lambda: {"current_f": 84.2, "daily_high_f": 85.0})
+    assert alg.get_full_state([])["temp"]["daily_high_raw_f"] is None       # older snapshots without it still work
+
+
+def test_live_monitor_passes_the_raw_high_to_the_tracker(monkeypatch):
+    from kalshi_api import price_tracker as pt
+    from kalshi_api import temp_monitor
+
+    now = _real_today_or_skip()
+    for name in ("_daily_high_f", "_date_str", "_current_f", "_daily_high_raw_f", "_raw_date_str"):
+        monkeypatch.setattr(pt, name, None)
+    observations = [{"observed_at": (now - timedelta(minutes=10)).isoformat(), "temp_f": 84.2}]
+    monkeypatch.setattr(temp_monitor, "fetch_recent_observations", lambda now=None, reuse_seconds=0: (observations, {}))
+    use_nws(monkeypatch, [(now - timedelta(minutes=30), 29.4)])
+    out = temp_monitor.fetch_current_high()
+    assert out["today_high_f"] == 85.0 and out["today_high_raw_f"] == pytest.approx(84.92)
+    temp_monitor.apply_current_high(out)
+    snap = pt.get_temp_snapshot()
+    assert snap["daily_high_f"] == 85.0 and snap["daily_high_raw_f"] == pytest.approx(84.92)
+
+
+def test_model_input_carries_the_raw_high(monkeypatch):
+    import weather
+    from kalshi_api import forecast
+    from kalshi_api import price_tracker as pt
+
+    now = _real_today_or_skip()
+    for name in ("_daily_high_f", "_date_str", "_current_f", "_daily_high_raw_f", "_raw_date_str"):
+        monkeypatch.setattr(pt, name, None)
+    obs = {"observed_at": (now - timedelta(minutes=5)).isoformat(), "temp_f": 84.2, "relative_humidity": 0.7,
+           "cloud_fraction": 0.2, "wind_speed_mph": 5.0, "wind_dir_deg": 90.0, "pressure_hpa": 1015.0}
+    shared = {"metadata": {"status": "healthy", "source": "TEST"}, "current": obs, "recent_observations": [obs],
+              "today": {"high_f": 84.2}, "features": {"pressure_trend_hpa_per_hr": 0.1}}
+    monkeypatch.setattr(weather, "build_live_shared_input", lambda: shared)
+    use_nws(monkeypatch, [(now - timedelta(minutes=30), 29.4)])
+    data, _ = forecast._fetch_hfmetar_shared()
+    assert data["asos_current"]["today_high_f"] == 85.0
+    assert data["asos_current"]["today_high_raw_f"] == pytest.approx(84.92)
+    forecast._apply_asos_current(data["asos_current"])
+    assert pt.get_temp_snapshot()["daily_high_raw_f"] == pytest.approx(84.92)

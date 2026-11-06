@@ -1686,3 +1686,8 @@ h1 {
   max-width: 460px;
   color: #6f6a63;
 }
+
+.algo-temp-raw {
+  font-weight: 500;
+  opacity: 0.85;
+}

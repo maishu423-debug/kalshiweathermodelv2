@@ -315,31 +315,41 @@ def _load_nws_readings(now=None):
 
 def _nws_high_today(now):
     """
-    (whole-F lower bound of today's high from the NWS readings, reason). Hourly and special reports carry tenths of a
+    (whole-F lower bound of today's high from the NWS readings, hottest UNROUNDED reading in F, reason). Hourly and
+    special reports carry tenths of a
     degree C, which fixes the F value exactly (29.4C = 85F); the 5-minute rows are whole C and only give their lowest
     possible F value. Only readings from today's climate day count. Never raises.
     """
     global _nws_fail_until
     if time.monotonic() < _nws_fail_until:
-        return None, "NWS readings unavailable (retrying shortly)"
+        return None, None, "NWS readings unavailable (retrying shortly)"
     try:
         data = _cached("nws_readings", NWS_READINGS_TTL_SEC, _load_nws_readings)
     except Exception:
         _nws_fail_until = time.monotonic() + FLOOR_FAILURE_BACKOFF_SEC
-        return None, "NWS readings unavailable"
+        return None, None, "NWS readings unavailable"
     start = max(_day_start(now, LST), _day_start(now, ET))
-    best = None
+    best = raw_best = None
     for when, celsius in data.get("readings", []):
         if when < start or when > now + timedelta(minutes=5):
             continue
-        low = lower_bound_whole_f(celsius * 9.0 / 5.0 + 32.0)
+        fahrenheit = celsius * 9.0 / 5.0 + 32.0
+        low = lower_bound_whole_f(fahrenheit)
         best = low if best is None else max(best, low)
-    return best, ("ok" if best is not None else "no NWS readings yet today")
+        raw_best = fahrenheit if raw_best is None else max(raw_best, fahrenheit)
+    return best, raw_best, ("ok" if best is not None else "no NWS readings yet today")
 
 
 def resolve_known_high(hfmetar_high_f, now=None):
+    """Today's high to use, in whole degrees F. See resolve_known_high_detail()."""
+    return resolve_known_high_detail(hfmetar_high_f, now)[0]
+
+
+def resolve_known_high_detail(hfmetar_high_f, now=None):
     """
-    Today's high to use, in whole degrees F (a LOWER bound: the highest value we can prove).
+    (high, raw_high): today's high to use, and the hottest UNROUNDED reading seen today (for display).
+
+    `high` is in whole degrees F (a LOWER bound: the highest value we can prove).
 
       * The NOAA 5-minute feed reports whole degrees C, so its high only narrows the true high to one or two whole-F
         values (84.2F means 84 or 85). Start from the lowest, so a bucket that is still alive is never marked dead.
@@ -348,11 +358,13 @@ def resolve_known_high(hfmetar_high_f, now=None):
       * Guards: a DSM must be for today's climate day; a bound more than DSM_MAX_EXCESS_F above the HFMETAR high is
         rejected as bad data; if a source fails it is simply left out. Never raises: on any error the HFMETAR value
         is returned unchanged.
+      * `raw_high` is the hottest reading, unrounded, from the NOAA 5-minute feed and the NWS readings (84.92F when the
+        high is a 29.4C report that the bot counts as 85F). It is for display only.
     """
     try:
         if hfmetar_high_f is None:
             _record(False, "no HFMETAR high yet", source="none")
-            return None
+            return None, None
         now = now or datetime.now(timezone.utc)
         possible = possible_whole_f(hfmetar_high_f)
         low, high = min(possible), max(possible)
@@ -360,7 +372,8 @@ def resolve_known_high(hfmetar_high_f, now=None):
         info = {"hfmetar_high_f": hfmetar_high_f, "hfmetar_possible_f": [low, high]}
         notes = []
 
-        nws_high, nws_why = _nws_high_today(now)
+        nws_high, nws_raw, nws_why = _nws_high_today(now)
+        raw_high = float(hfmetar_high_f) if nws_raw is None else max(float(hfmetar_high_f), nws_raw)
         dsm_entry, dsm_why = _todays_dsm_high(now)
         bounds = []
         if nws_high is not None:
@@ -393,8 +406,9 @@ def resolve_known_high(hfmetar_high_f, now=None):
         if notes:
             reason += " - " + "; ".join(notes)
         info["effective_high_f"] = best
+        info["raw_high_f"] = round(raw_high, 2)
         _record(best > low, reason, source=source, **info)
-        return best
+        return best, round(raw_high, 2)
     except Exception as exc:                        # this must never break the weather pipeline
         _record(False, f"error: {type(exc).__name__}", source="error")
-        return hfmetar_high_f
+        return hfmetar_high_f, hfmetar_high_f

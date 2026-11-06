@@ -26,6 +26,8 @@ _price_history = defaultdict(lambda: deque(maxlen=60))
 _current_f    = None
 _daily_high_f = None
 _date_str     = None   # YYYY-MM-DD, used to detect midnight rollover
+_daily_high_raw_f = None   # hottest UNROUNDED reading today (F), shown next to the recorded high
+_raw_date_str     = None
 
 _started = False
 
@@ -54,6 +56,25 @@ def record_price(ticker: str, yes_bid_cents, yes_ask_cents):
         })
 
 
+def _advance_raw_high_locked(value_f: float):
+    """Caller holds _lock. Today's hottest unrounded reading: resets on a new day, never lowers."""
+    global _daily_high_raw_f, _raw_date_str
+    today = _today_key()
+    if _raw_date_str != today:
+        _raw_date_str = today
+        _daily_high_raw_f = None
+    if _daily_high_raw_f is None or value_f > _daily_high_raw_f:
+        _daily_high_raw_f = value_f
+
+
+def set_daily_high_raw(high_f: float):
+    """Record today's hottest unrounded reading (display only)."""
+    if high_f is None:
+        return
+    with _lock:
+        _advance_raw_high_locked(float(high_f))
+
+
 def update_temp(temp_f: float):
     """Update current temperature and advance daily_high when this reading is hotter."""
     global _current_f, _daily_high_f, _date_str
@@ -63,6 +84,7 @@ def update_temp(temp_f: float):
     # the reading can mean (the displayed current temperature stays as reported).
     provable = float(lower_bound_whole_f(temp_f))
     with _lock:
+        _advance_raw_high_locked(float(temp_f))
         today = _today_key()
         if _date_str != today:
             _date_str = today
@@ -117,6 +139,7 @@ def get_temp_snapshot() -> dict:
         return {
             "current_f":    _current_f,
             "daily_high_f": _daily_high_f,
+            "daily_high_raw_f": _daily_high_raw_f if _raw_date_str == _today_key() else None,
         }
 
 

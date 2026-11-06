@@ -62,12 +62,14 @@ def _apply_asos_current(asos: dict):
     with _lock:
         _cache["asos_current"] = asos
 
-    from .price_tracker import set_daily_high_nws, update_temp
+    from .price_tracker import set_daily_high_nws, set_daily_high_raw, update_temp
 
     if asos.get("t0_f") is not None:
         update_temp(float(asos["t0_f"]))
     if asos.get("today_high_f") is not None:
         set_daily_high_nws(float(asos["today_high_f"]))
+    if asos.get("today_high_raw_f") is not None:
+        set_daily_high_raw(float(asos["today_high_raw_f"]))
 
 
 def _cached_model_high_f():
@@ -115,7 +117,7 @@ def _fetch_hfmetar_shared():
     """
     from weather import build_live_shared_input
 
-    from .nws import resolve_known_high
+    from .nws import resolve_known_high_detail
     from weather.asos_nowcast import STATUS_UNAVAILABLE, build_future_features
     from weather.asos_parser import parse_utc
 
@@ -156,12 +158,15 @@ def _fetch_hfmetar_shared():
             "Wind": _wind_block(row.get("wind_speed_mph"), row.get("wind_dir_deg"), imperial=False),
         })
 
+    today_high, today_high_raw = resolve_known_high_detail((shared.get("today") or {}).get("high_f"))
+
     return {
         "curr_raw": curr_raw,
         "fore_raw": fore_raw,
         "asos_current": {"t0_f": float(cur["temp_f"]),
                          # best provable high: the NOAA 5-minute high as a range, raised by the NWS hourly / DSM highs
-                         "today_high_f": resolve_known_high((shared.get("today") or {}).get("high_f")),
+                         "today_high_f": today_high,
+                         "today_high_raw_f": today_high_raw,
                          "observed_at": cur["observed_at"],
                          # Live pressure tendency (hPa/h) so the models don't reuse a stale cached value.
                          "pressure_trend_hpa_per_hr": (shared.get("features") or {}).get("pressure_trend_hpa_per_hr"),

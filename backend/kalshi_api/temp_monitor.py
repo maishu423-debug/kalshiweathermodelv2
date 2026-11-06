@@ -14,7 +14,7 @@ from weather.asos_client import fetch_recent_observations
 from weather.asos_nowcast import STATUS_UNAVAILABLE, freshness_status, todays_high
 from weather.asos_parser import parse_utc
 
-from .nws import resolve_known_high
+from .nws import resolve_known_high_detail
 
 POLL_INTERVAL = 60
 
@@ -35,10 +35,12 @@ def fetch_current_high():
         return None
     latest = observations[-1]
     age = max(0.0, (now - parse_utc(latest["observed_at"])).total_seconds())
+    today_high, today_high_raw = resolve_known_high_detail(todays_high(observations, now)["high_f"], now)
     return {
         "t0_f": latest["temp_f"],
         # best provable high: the NOAA 5-minute high as a range, raised by the NWS hourly / DSM highs
-        "today_high_f": resolve_known_high(todays_high(observations, now)["high_f"], now),
+        "today_high_f": today_high,
+        "today_high_raw_f": today_high_raw,
         "observed_at": latest["observed_at"],
         "source": wcfg.SOURCE_ID,
         "status": freshness_status(age),
@@ -52,7 +54,7 @@ def apply_current_high(observation: dict):
         global _latest
         _latest = dict(observation)
 
-    from .price_tracker import set_daily_high_nws, update_temp
+    from .price_tracker import set_daily_high_nws, set_daily_high_raw, update_temp
 
     # The high is a record of what happened, so it advances even when the feed is delayed;
     # the current temperature is only pushed from a usable (not unavailable) observation.
@@ -60,6 +62,8 @@ def apply_current_high(observation: dict):
         update_temp(float(observation["t0_f"]))
     if observation.get("today_high_f") is not None:
         set_daily_high_nws(float(observation["today_high_f"]))
+    if observation.get("today_high_raw_f") is not None:
+        set_daily_high_raw(float(observation["today_high_raw_f"]))
 
 
 def refresh_temp_now():

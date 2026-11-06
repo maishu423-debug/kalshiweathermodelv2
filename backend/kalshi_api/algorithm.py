@@ -502,6 +502,8 @@ def get_full_state(markets: list, paper_state=None, enabled_models=None) -> dict
         "temp": {
             "current_f":    round(nws_temp["current_f"],    1) if nws_temp["current_f"]    is not None else None,
             "daily_high_f": nws_round_temp_f(nws_temp["daily_high_f"]) if nws_temp["daily_high_f"] is not None else None,
+            # hottest unrounded reading today, shown next to the recorded high (e.g. 84.9 when the high is 85)
+            "daily_high_raw_f": round(nws_temp["daily_high_raw_f"], 2) if nws_temp.get("daily_high_raw_f") is not None else None,
         },
         "analysis":       analyses,
         "recommendation": recommendation,
